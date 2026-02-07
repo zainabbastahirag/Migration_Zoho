@@ -281,69 +281,97 @@ public class MigrationService : IMigrationService
     }
 
     // ================================================================
-    //  PHASE 3 — CVs  (concurrent, per-upload delay)
+    //  PHASE 3 — CVs  (sequential — DbContext is NOT thread-safe)
+    //  Downloads from Azure Blob → uploads to Zoho, one at a time.
     // ================================================================
 
     private async Task MigrateCvsAsync(MigrationRun run, CancellationToken ct)
     {
-        int ok = 0, fail = 0, cursor = 0;
-        var sem = new SemaphoreSlim(_cfg.MaxConcurrentCvUploads);
+        int ok = 0, fail = 0;
 
-        while (true)
+        // Use the same query pattern as the old working code: re-query after each batch
+        var candidates = await _db.Candidates
+            .Where(c => c.IsMigrated && !c.IsCvMigrated
+                && !string.IsNullOrEmpty(c.ResumeUrl)
+                && !string.IsNullOrEmpty(c.ZohoCandidateId))
+            .Take(_cfg.CvsBatchSize)
+            .ToListAsync(ct);
+
+        while (candidates.Count > 0)
         {
-            var batch = await _db.Candidates
-                .Where(c => c.IsMigrated && !c.IsCvMigrated
-                    && !string.IsNullOrEmpty(c.ResumeUrl)
-                    && !string.IsNullOrEmpty(c.ZohoCandidateId)
-                    && c.Id > cursor)
-                .OrderBy(c => c.Id)
-                .Take(_cfg.CvsBatchSize)
-                .ToListAsync(ct);
-
-            if (batch.Count == 0) break;
-
-            var tasks = batch.Select(async c =>
+            foreach (var candidate in candidates)
             {
-                await sem.WaitAsync(ct);
                 try
                 {
-                    if (await UploadOneCvAsync(c, ct))
-                        Interlocked.Increment(ref ok);
-                    else
-                        Interlocked.Increment(ref fail);
+                    // 1. Download CV from Azure Blob Storage
+                    var (stream, contentType, fileName) =
+                        await _blob.GetCvWithMetadataAsync(candidate.ResumeUrl!, ct);
 
-                    // per-upload delay to avoid hitting Zoho rate limit
-                    await Task.Delay(_cfg.CvsDelayMs, ct);
+                    if (stream == null)
+                    {
+                        _log.LogWarning("CV not found in blob for candidate {Id}: {Url}",
+                            candidate.Id, candidate.ResumeUrl);
+                        fail++;
+                        continue;
+                    }
+
+                    using (stream)
+                    {
+                        var cvFileName = fileName
+                            ?? GetFileNameFromUrl(candidate.ResumeUrl!)
+                            ?? $"resume_{candidate.OdooId}.pdf";
+                        var cvContentType = contentType ?? "application/pdf";
+
+                        // 2. Upload CV to Zoho Recruit
+                        var result = await _zoho.UploadCandidateCvAsync(
+                            candidate.ZohoCandidateId!,
+                            stream,
+                            cvFileName,
+                            cvContentType,
+                            ct);
+
+                        candidate.IsCvMigrated = result.Success;
+                        candidate.CvMigratedAt = result.Success ? DateTime.UtcNow : null;
+
+                        if (result.Success)
+                        {
+                            ok++;
+                            _log.LogInformation("  CV uploaded for candidate {Id} ({File})",
+                                candidate.Id, cvFileName);
+                        }
+                        else
+                        {
+                            fail++;
+                            _log.LogWarning("  CV upload FAILED for candidate {Id}: {Err}",
+                                candidate.Id, result.ErrorMessage);
+                        }
+                    }
                 }
-                finally { sem.Release(); }
-            });
+                catch (Exception ex)
+                {
+                    fail++;
+                    _log.LogError(ex, "  CV error for candidate {Id}", candidate.Id);
+                }
 
-            await Task.WhenAll(tasks);
-
-            run.TotalCvsUploaded = ok; run.FailedCvUploads = fail;
-            await _db.SaveChangesAsync(ct);
-            cursor = batch.Max(c => c.Id);
-            _log.LogInformation("  CVs: {Ok} uploaded, {Fail} failed (cursor={C})", ok, fail, cursor);
-        }
-    }
-
-    private async Task<bool> UploadOneCvAsync(Candidate c, CancellationToken ct)
-    {
-        try
-        {
-            var (stream, contentType, fileName) = await _blob.GetCvWithMetadataAsync(c.ResumeUrl!, ct);
-            if (stream == null) return false;
-            using (stream)
-            {
-                var fn = fileName ?? GetFileNameFromUrl(c.ResumeUrl!) ?? $"resume_{c.OdooId}.pdf";
-                var result = await _zoho.UploadCandidateCvAsync(
-                    c.ZohoCandidateId!, stream, fn, contentType ?? "application/pdf", ct);
-                c.IsCvMigrated = result.Success;
-                c.CvMigratedAt = result.Success ? DateTime.UtcNow : null;
-                return result.Success;
+                // Throttle between each individual upload
+                await Task.Delay(_cfg.CvsDelayMs, ct);
             }
+
+            // Save batch and update run counts
+            run.TotalCvsUploaded = ok;
+            run.FailedCvUploads = fail;
+            await _db.SaveChangesAsync(ct);
+
+            _log.LogInformation("  CVs: {Ok} uploaded, {Fail} failed so far", ok, fail);
+
+            // Re-query for next batch (same pattern as old working code)
+            candidates = await _db.Candidates
+                .Where(c => c.IsMigrated && !c.IsCvMigrated
+                    && !string.IsNullOrEmpty(c.ResumeUrl)
+                    && !string.IsNullOrEmpty(c.ZohoCandidateId))
+                .Take(_cfg.CvsBatchSize)
+                .ToListAsync(ct);
         }
-        catch (Exception ex) { _log.LogError(ex, "CV upload failed: candidate {Id}", c.Id); return false; }
     }
 
     // ================================================================
