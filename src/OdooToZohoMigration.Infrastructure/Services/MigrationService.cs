@@ -330,14 +330,25 @@ public class MigrationService : IMigrationService
                             cvContentType,
                             ct);
 
-                        candidate.IsCvMigrated = result.Success;
-                        candidate.CvMigratedAt = result.Success ? DateTime.UtcNow : null;
-
                         if (result.Success)
                         {
+                            candidate.IsCvMigrated = true;
+                            candidate.CvMigratedAt = DateTime.UtcNow;
                             ok++;
                             _log.LogInformation("  CV uploaded for candidate {Id} ({File})",
                                 candidate.Id, cvFileName);
+                        }
+                        else if (result.ErrorMessage != null &&
+                                 result.ErrorMessage.Contains("not allowed to attach more than one file",
+                                     StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Zoho already has a resume for this candidate — treat as done
+                            candidate.IsCvMigrated = true;
+                            candidate.CvMigratedAt = DateTime.UtcNow;
+                            ok++;
+                            _log.LogInformation(
+                                "  CV already exists in Zoho for candidate {Id} — marked as synced",
+                                candidate.Id);
                         }
                         else
                         {
