@@ -668,43 +668,102 @@ public class ZohoRecruitService : IZohoRecruitService
 
     #region Helper Methods
 
+    /// <summary>
+    /// Central method for every Zoho API call. Handles:
+    ///   - OAuth token injection
+    ///   - HTTP 429 (Too Many Requests) → automatic retry with exponential back-off
+    ///   - HTTP 401 (Unauthorized) → cache eviction + throw so caller can retry
+    ///   - Logging of every request/response
+    ///
+    /// Rate-limit config comes from ZohoRecruitSettings:
+    ///   RateLimitMaxRetries      (default 5)
+    ///   RateLimitRetryBaseDelayMs (default 60 000 ms = 1 min)
+    /// </summary>
     private async Task<T?> SendZohoRequestAsync<T>(
         HttpMethod method, string endpoint, object? body = null,
         CancellationToken ct = default) where T : class
     {
-        var token = await GetAccessTokenAsync(ct);
         var url = $"https://{_settings.ApiDomain}{endpoint}";
+        string? serializedBody = body != null ? JsonSerializer.Serialize(body) : null;
 
-        using var request = new HttpRequestMessage(method, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Zoho-oauthtoken", token);
-
-        if (body != null)
+        for (int attempt = 0; attempt <= _settings.RateLimitMaxRetries; attempt++)
         {
-            var json = JsonSerializer.Serialize(body);
-            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-            _logger.LogDebug("Zoho API Request: {Method} {Url}", method, url);
-        }
+            var token = await GetAccessTokenAsync(ct);
 
-        var response = await _httpClient.SendAsync(request, ct);
-        var responseContent = await response.Content.ReadAsStringAsync(ct);
+            using var request = new HttpRequestMessage(method, url);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Zoho-oauthtoken", token);
 
-        _logger.LogDebug("Zoho API Response: {StatusCode}", response.StatusCode);
+            if (serializedBody != null)
+            {
+                request.Content = new StringContent(serializedBody, Encoding.UTF8, "application/json");
+            }
 
-        if (!response.IsSuccessStatusCode)
-        {
+            _logger.LogDebug("Zoho API [{Attempt}] {Method} {Url}", attempt, method, url);
+
+            var response = await _httpClient.SendAsync(request, ct);
+            var responseContent = await response.Content.ReadAsStringAsync(ct);
+
+            // ── SUCCESS ──────────────────────────────────────────────
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogDebug("Zoho API OK: {StatusCode}", response.StatusCode);
+                return JsonSerializer.Deserialize<T>(responseContent);
+            }
+
+            // ── 429 TOO MANY REQUESTS ────────────────────────────────
+            if (response.StatusCode == (System.Net.HttpStatusCode)429)
+            {
+                if (attempt >= _settings.RateLimitMaxRetries)
+                {
+                    _logger.LogError(
+                        "Zoho API rate limit exceeded after {Max} retries. Giving up. Endpoint: {Url}",
+                        _settings.RateLimitMaxRetries, url);
+                    throw new HttpRequestException(
+                        $"Zoho rate limit exceeded after {_settings.RateLimitMaxRetries} retries: {responseContent}");
+                }
+
+                // Use Retry-After header if present, otherwise exponential back-off
+                int delayMs = _settings.RateLimitRetryBaseDelayMs * (int)Math.Pow(2, attempt);
+
+                if (response.Headers.RetryAfter?.Delta is TimeSpan retryAfter)
+                {
+                    delayMs = (int)retryAfter.TotalMilliseconds;
+                }
+
+                _logger.LogWarning(
+                    "Zoho API 429 rate limit hit on {Url}. Waiting {Delay} ms before retry {Attempt}/{Max}...",
+                    url, delayMs, attempt + 1, _settings.RateLimitMaxRetries);
+
+                await Task.Delay(delayMs, ct);
+                continue; // retry
+            }
+
+            // ── 401 UNAUTHORIZED (token expired) ─────────────────────
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                _logger.LogWarning("Zoho API 401 — token expired. Clearing cache and refreshing...");
+                _cache.Remove(TokenCacheKey);
+
+                if (attempt < _settings.RateLimitMaxRetries)
+                {
+                    await RefreshAccessTokenAsync(ct);
+                    continue; // retry with fresh token
+                }
+
+                throw new InvalidOperationException(
+                    $"Zoho token expired and refresh failed after {attempt} attempts: {responseContent}");
+            }
+
+            // ── OTHER ERRORS ─────────────────────────────────────────
             _logger.LogError("Zoho API error. Status: {StatusCode}, Response: {Response}",
                 response.StatusCode, responseContent);
 
-            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
-            {
-                _cache.Remove(TokenCacheKey);
-                throw new InvalidOperationException("Zoho token expired. Please retry the operation.");
-            }
-
-            throw new HttpRequestException($"Zoho API returned {response.StatusCode}: {responseContent}");
+            throw new HttpRequestException(
+                $"Zoho API returned {response.StatusCode}: {responseContent}");
         }
 
-        return JsonSerializer.Deserialize<T>(responseContent);
+        // should never reach here, but just in case
+        throw new HttpRequestException($"Zoho API call to {url} failed after all retries");
     }
 
     #endregion

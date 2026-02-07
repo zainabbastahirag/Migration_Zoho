@@ -10,17 +10,21 @@ using OdooToZohoMigration.Infrastructure.Data;
 namespace OdooToZohoMigration.Infrastructure.Services;
 
 /// <summary>
-/// Config-driven migration service.  Set MigrationSettings.Enabled = true and run.
-/// All phases, batch sizes and retry behaviour come from appsettings.json.
+/// Config-driven migration service.
 ///
-/// Key optimisations vs. the original:
-///   - Cursor-based pagination  (OrderBy Id + lastProcessedId)
-///   - Index-based Zoho batch mapping  (no extra GET call per record)
-///   - Concurrent CV uploads  (SemaphoreSlim)
-///   - Batch notes API for comments / summaries / history
-///   - Every record written to MigrationLogs
-///   - MigrationRun counts updated after every batch
-///   - Duplicate candidates detected and all matching DB rows marked synced
+/// Every batch size and delay is configurable per entity type in appsettings.json:
+///   JobsBatchSize / JobsDelayMs
+///   CandidatesBatchSize / CandidatesDelayMs
+///   CvsBatchSize / CvsDelayMs / MaxConcurrentCvUploads
+///   ApplicationsBatchSize / ApplicationsDelayMs
+///   CommentsBatchSize / CommentsDelayMs
+///   SummariesBatchSize / SummariesDelayMs
+///   HistoryBatchSize / HistoryDelayMs
+///
+/// Rate-limit 429 handling is inside ZohoRecruitService.SendZohoRequestAsync —
+/// it auto-retries with exponential back-off so this service does not need to
+/// worry about 429s at all.  The delays configured here are ADDITIONAL throttle
+/// to stay well under the limit proactively.
 /// </summary>
 public class MigrationService : IMigrationService
 {
@@ -45,7 +49,7 @@ public class MigrationService : IMigrationService
     }
 
     // ================================================================
-    //  PUBLIC ENTRY POINT
+    //  ENTRY POINT
     // ================================================================
 
     public async Task RunAsync(CancellationToken ct = default)
@@ -57,104 +61,96 @@ public class MigrationService : IMigrationService
             Status = "Running"
         };
 
-        // ── count what needs doing ───────────────────────────────────
         if (_cfg.MigrateJobs)
-            run.TotalJobs = await PendingJobs(_cfg.RetryFailed, ct);
+            run.TotalJobs = await PendingJobs(ct);
         if (_cfg.MigrateCandidates)
-            run.TotalCandidates = await PendingCandidates(_cfg.RetryFailed, ct);
+            run.TotalCandidates = await PendingCandidates(ct);
         if (_cfg.MigrateApplications)
-            run.TotalApplications = await PendingApplications(_cfg.RetryFailed, ct);
+            run.TotalApplications = await PendingApplications(ct);
 
         _db.MigrationRuns.Add(run);
         await _db.SaveChangesAsync(ct);
 
-        _log.LogInformation(
-            "╔══════════════════════════════════════════════════╗");
-        _log.LogInformation(
-            "║  Migration Run {Id} — {Type}                    ║", run.Id, run.RunType);
-        _log.LogInformation(
-            "║  Jobs={J}  Candidates={C}  Apps={A}             ║",
-            run.TotalJobs, run.TotalCandidates, run.TotalApplications);
-        _log.LogInformation(
-            "╚══════════════════════════════════════════════════╝");
+        _log.LogInformation("╔══════════════════════════════════════════════════════════════╗");
+        _log.LogInformation("║  Migration Run {Id} — {Type}                                 ║", run.Id, run.RunType);
+        _log.LogInformation("║  Jobs={J} (batch {JB})  Candidates={C} (batch {CB})          ║",
+            run.TotalJobs, _cfg.JobsBatchSize, run.TotalCandidates, _cfg.CandidatesBatchSize);
+        _log.LogInformation("║  Apps={A} (batch {AB})  CVs (batch {CVB}, x{CC} parallel)    ║",
+            run.TotalApplications, _cfg.ApplicationsBatchSize, _cfg.CvsBatchSize, _cfg.MaxConcurrentCvUploads);
+        _log.LogInformation("╚══════════════════════════════════════════════════════════════╝");
 
         try
         {
-            // Phase 1 ─ Jobs
             if (_cfg.MigrateJobs && run.TotalJobs > 0)
             {
-                _log.LogInformation("▶ Phase 1/7: Jobs ({Count} pending)", run.TotalJobs);
+                _log.LogInformation("▶ Phase 1/7: Jobs ({Count} pending, batch={B}, delay={D}ms)",
+                    run.TotalJobs, _cfg.JobsBatchSize, _cfg.JobsDelayMs);
                 await MigrateJobsAsync(run, ct);
             }
 
-            // Phase 2 ─ Candidates
             if (_cfg.MigrateCandidates && run.TotalCandidates > 0)
             {
-                _log.LogInformation("▶ Phase 2/7: Candidates ({Count} pending)", run.TotalCandidates);
+                _log.LogInformation("▶ Phase 2/7: Candidates ({Count} pending, batch={B}, delay={D}ms)",
+                    run.TotalCandidates, _cfg.CandidatesBatchSize, _cfg.CandidatesDelayMs);
                 await MigrateCandidatesAsync(run, ct);
             }
 
-            // Phase 3 ─ CVs
             if (_cfg.MigrateCvs)
             {
-                var pending = await _db.Candidates.CountAsync(c =>
+                var p = await _db.Candidates.CountAsync(c =>
                     c.IsMigrated && !c.IsCvMigrated
                     && !string.IsNullOrEmpty(c.ResumeUrl)
                     && !string.IsNullOrEmpty(c.ZohoCandidateId), ct);
-
-                if (pending > 0)
+                if (p > 0)
                 {
-                    _log.LogInformation("▶ Phase 3/7: CVs ({Count} pending, concurrency={C})",
-                        pending, _cfg.MaxConcurrentCvUploads);
+                    _log.LogInformation("▶ Phase 3/7: CVs ({Count} pending, batch={B}, x{CC} parallel, delay={D}ms)",
+                        p, _cfg.CvsBatchSize, _cfg.MaxConcurrentCvUploads, _cfg.CvsDelayMs);
                     await MigrateCvsAsync(run, ct);
                 }
             }
 
-            // Phase 4 ─ Applications
             if (_cfg.MigrateApplications && run.TotalApplications > 0)
             {
-                _log.LogInformation("▶ Phase 4/7: Applications ({Count} pending)", run.TotalApplications);
+                _log.LogInformation("▶ Phase 4/7: Applications ({Count} pending, batch={B}, delay={D}ms per call)",
+                    run.TotalApplications, _cfg.ApplicationsBatchSize, _cfg.ApplicationsDelayMs);
                 await MigrateApplicationsAsync(run, ct);
             }
 
-            // Phase 5 ─ Comments
             if (_cfg.MigrateComments)
             {
-                var pending = await _db.ApplicationComments.CountAsync(c =>
+                var p = await _db.ApplicationComments.CountAsync(c =>
                     !c.IsMigrated && c.Application.IsMigrated
                     && !string.IsNullOrEmpty(c.Application.Candidate.ZohoCandidateId), ct);
-
-                if (pending > 0)
+                if (p > 0)
                 {
-                    _log.LogInformation("▶ Phase 5/7: Comments ({Count} pending)", pending);
+                    _log.LogInformation("▶ Phase 5/7: Comments ({Count} pending, batch={B}, delay={D}ms)",
+                        p, _cfg.CommentsBatchSize, _cfg.CommentsDelayMs);
                     await MigrateCommentsAsync(run, ct);
                 }
             }
 
-            // Phase 6 ─ Summaries
             if (_cfg.MigrateSummaries)
             {
-                var pending = await _db.ApplicationSummaries.CountAsync(s =>
+                var p = await _db.ApplicationSummaries.CountAsync(s =>
                     !s.IsMigrated && s.Application != null && s.Application.IsMigrated
                     && !string.IsNullOrEmpty(s.Application.Candidate.ZohoCandidateId), ct);
-
-                if (pending > 0)
+                if (p > 0)
                 {
-                    _log.LogInformation("▶ Phase 6/7: Summaries ({Count} pending)", pending);
+                    _log.LogInformation("▶ Phase 6/7: Summaries ({Count} pending, batch={B}, delay={D}ms)",
+                        p, _cfg.SummariesBatchSize, _cfg.SummariesDelayMs);
                     await MigrateSummariesAsync(run, ct);
                 }
             }
 
-            // Phase 7 ─ History
             if (_cfg.MigrateHistory)
             {
-                var pending = await _db.ApplicationHistories.CountAsync(h =>
+                var p = await _db.ApplicationHistories.CountAsync(h =>
                     !h.IsMigrated && h.Application.IsMigrated
                     && !string.IsNullOrEmpty(h.Application.Candidate.ZohoCandidateId), ct);
-
-                if (pending > 0)
+                if (p > 0)
                 {
-                    _log.LogInformation("▶ Phase 7/7: History ({Count} pending)", pending);
+                    _log.LogInformation("▶ Phase 7/7: History ({Count} pending, batch={B}, delay={D}ms)",
+                        p, _cfg.HistoryBatchSize, _cfg.HistoryDelayMs);
                     await MigrateHistoryAsync(run, ct);
                 }
             }
@@ -174,13 +170,12 @@ public class MigrationService : IMigrationService
         }
 
         run.CompletedAt = DateTime.UtcNow;
-        await _db.SaveChangesAsync(CancellationToken.None); // save even if cancelled
-
+        await _db.SaveChangesAsync(CancellationToken.None);
         LogFinalSummary(run);
     }
 
     // ================================================================
-    //  PHASE 1 — JOBS  (batch create, index mapping)
+    //  PHASE 1 — JOBS
     // ================================================================
 
     private async Task MigrateJobsAsync(MigrationRun run, CancellationToken ct)
@@ -193,7 +188,7 @@ public class MigrationService : IMigrationService
                 .Where(j => !j.IsMigrated && j.Id > cursor
                     && (_cfg.RetryFailed || string.IsNullOrEmpty(j.MigrationError)))
                 .OrderBy(j => j.Id)
-                .Take(_cfg.BatchSize)
+                .Take(_cfg.JobsBatchSize)
                 .ToListAsync(ct);
 
             if (batch.Count == 0) break;
@@ -202,8 +197,7 @@ public class MigrationService : IMigrationService
 
             for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
-                var j = batch[i];
-                var r = results[i];
+                var j = batch[i]; var r = results[i];
                 j.IsMigrated = r.Success;
                 j.ZohoJobId = r.ZohoId;
                 j.MigratedAt = r.Success ? DateTime.UtcNow : null;
@@ -212,17 +206,18 @@ public class MigrationService : IMigrationService
                 if (r.Success) ok++; else fail++;
             }
 
-            run.MigratedJobs = ok;
-            run.FailedJobs = fail;
+            run.MigratedJobs = ok; run.FailedJobs = fail;
             await _db.SaveChangesAsync(ct);
             cursor = batch.Max(j => j.Id);
-            _log.LogInformation("  Jobs: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
-            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
+            _log.LogInformation("  Jobs: {Ok}/{Total} synced, {Fail} failed (cursor={C})",
+                ok, run.TotalJobs, fail, cursor);
+
+            await Task.Delay(_cfg.JobsDelayMs, ct);
         }
     }
 
     // ================================================================
-    //  PHASE 2 — CANDIDATES  (batch create, duplicate handling)
+    //  PHASE 2 — CANDIDATES
     // ================================================================
 
     private async Task MigrateCandidatesAsync(MigrationRun run, CancellationToken ct)
@@ -235,72 +230,58 @@ public class MigrationService : IMigrationService
                 .Where(c => !c.IsMigrated && !string.IsNullOrEmpty(c.Email) && c.Id > cursor
                     && (_cfg.RetryFailed || string.IsNullOrEmpty(c.MigrationError)))
                 .OrderBy(c => c.Id)
-                .Take(_cfg.BatchSize)
+                .Take(_cfg.CandidatesBatchSize)
                 .ToListAsync(ct);
 
             if (batch.Count == 0) break;
 
-            // deduplicate within batch by email
             var unique = batch
                 .GroupBy(c => c.Email!.ToLowerInvariant())
                 .Select(g => g.First())
                 .ToList();
 
-            // Zoho returns results in SAME ORDER as input → index mapping
             var results = await _zoho.CreateCandidatesBatchAsync(unique, ct);
 
             for (int i = 0; i < unique.Count && i < results.Count; i++)
             {
-                var c = unique[i];
-                var r = results[i];
+                var c = unique[i]; var r = results[i];
                 bool dup = r.ErrorMessage?.Contains("Duplicate", StringComparison.OrdinalIgnoreCase) == true;
 
                 if (dup)
                 {
-                    // mark every DB row with same email as synced
                     var all = await _db.Candidates
-                        .Where(x => x.Email != null
-                            && x.Email.ToLower() == c.Email!.ToLower())
+                        .Where(x => x.Email != null && x.Email.ToLower() == c.Email!.ToLower())
                         .ToListAsync(ct);
                     foreach (var d in all)
                     {
-                        d.IsMigrated = true;
-                        d.MigratedAt = DateTime.UtcNow;
-                        d.ZohoCandidateId = r.ZohoId;
-                        d.MigrationError = null;
+                        d.IsMigrated = true; d.MigratedAt = DateTime.UtcNow;
+                        d.ZohoCandidateId = r.ZohoId; d.MigrationError = null;
                     }
                     ok += all.Count;
-                    _log.LogInformation("  Candidate {Email} duplicate in Zoho → {N} DB rows marked synced",
-                        c.Email, all.Count);
                 }
                 else if (r.Success)
                 {
-                    c.IsMigrated = true;
-                    c.ZohoCandidateId = r.ZohoId;
-                    c.MigratedAt = DateTime.UtcNow;
-                    c.MigrationError = null;
+                    c.IsMigrated = true; c.ZohoCandidateId = r.ZohoId;
+                    c.MigratedAt = DateTime.UtcNow; c.MigrationError = null;
                     ok++;
                 }
-                else
-                {
-                    c.MigrationError = r.ErrorMessage;
-                    fail++;
-                }
+                else { c.MigrationError = r.ErrorMessage; fail++; }
 
                 WriteLog("Candidate", c.Id, c.OdooId, r);
             }
 
-            run.MigratedCandidates = ok;
-            run.FailedCandidates = fail;
+            run.MigratedCandidates = ok; run.FailedCandidates = fail;
             await _db.SaveChangesAsync(ct);
             cursor = batch.Max(c => c.Id);
-            _log.LogInformation("  Candidates: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
-            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
+            _log.LogInformation("  Candidates: {Ok}/{Total} synced, {Fail} failed (cursor={C})",
+                ok, run.TotalCandidates, fail, cursor);
+
+            await Task.Delay(_cfg.CandidatesDelayMs, ct);
         }
     }
 
     // ================================================================
-    //  PHASE 3 — CVs  (concurrent upload via SemaphoreSlim)
+    //  PHASE 3 — CVs  (concurrent, per-upload delay)
     // ================================================================
 
     private async Task MigrateCvsAsync(MigrationRun run, CancellationToken ct)
@@ -316,7 +297,7 @@ public class MigrationService : IMigrationService
                     && !string.IsNullOrEmpty(c.ZohoCandidateId)
                     && c.Id > cursor)
                 .OrderBy(c => c.Id)
-                .Take(_cfg.BatchSize)
+                .Take(_cfg.CvsBatchSize)
                 .ToListAsync(ct);
 
             if (batch.Count == 0) break;
@@ -330,18 +311,19 @@ public class MigrationService : IMigrationService
                         Interlocked.Increment(ref ok);
                     else
                         Interlocked.Increment(ref fail);
+
+                    // per-upload delay to avoid hitting Zoho rate limit
+                    await Task.Delay(_cfg.CvsDelayMs, ct);
                 }
                 finally { sem.Release(); }
             });
 
             await Task.WhenAll(tasks);
 
-            run.TotalCvsUploaded = ok;
-            run.FailedCvUploads = fail;
+            run.TotalCvsUploaded = ok; run.FailedCvUploads = fail;
             await _db.SaveChangesAsync(ct);
             cursor = batch.Max(c => c.Id);
             _log.LogInformation("  CVs: {Ok} uploaded, {Fail} failed (cursor={C})", ok, fail, cursor);
-            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
     }
 
@@ -351,27 +333,21 @@ public class MigrationService : IMigrationService
         {
             var (stream, contentType, fileName) = await _blob.GetCvWithMetadataAsync(c.ResumeUrl!, ct);
             if (stream == null) return false;
-
             using (stream)
             {
                 var fn = fileName ?? GetFileNameFromUrl(c.ResumeUrl!) ?? $"resume_{c.OdooId}.pdf";
                 var result = await _zoho.UploadCandidateCvAsync(
                     c.ZohoCandidateId!, stream, fn, contentType ?? "application/pdf", ct);
-
                 c.IsCvMigrated = result.Success;
                 c.CvMigratedAt = result.Success ? DateTime.UtcNow : null;
                 return result.Success;
             }
         }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "CV upload failed for candidate {Id}", c.Id);
-            return false;
-        }
+        catch (Exception ex) { _log.LogError(ex, "CV upload failed: candidate {Id}", c.Id); return false; }
     }
 
     // ================================================================
-    //  PHASE 4 — APPLICATIONS  (associate API, 1-by-1 with throttle)
+    //  PHASE 4 — APPLICATIONS  (1-by-1 with configurable delay)
     // ================================================================
 
     private async Task MigrateApplicationsAsync(MigrationRun run, CancellationToken ct)
@@ -381,16 +357,13 @@ public class MigrationService : IMigrationService
         while (true)
         {
             var batch = await _db.Applications
-                .Include(a => a.Candidate)
-                .Include(a => a.Job)
+                .Include(a => a.Candidate).Include(a => a.Job)
                 .Where(a => !a.IsMigrated && a.Id > cursor
-                    && a.Candidate.IsMigrated
-                    && !string.IsNullOrEmpty(a.Candidate.ZohoCandidateId)
-                    && a.Job.IsMigrated
-                    && !string.IsNullOrEmpty(a.Job.ZohoJobId)
+                    && a.Candidate.IsMigrated && !string.IsNullOrEmpty(a.Candidate.ZohoCandidateId)
+                    && a.Job.IsMigrated && !string.IsNullOrEmpty(a.Job.ZohoJobId)
                     && (_cfg.RetryFailed || string.IsNullOrEmpty(a.MigrationError)))
                 .OrderBy(a => a.Id)
-                .Take(_cfg.BatchSize)
+                .Take(_cfg.ApplicationsBatchSize)
                 .ToListAsync(ct);
 
             if (batch.Count == 0) break;
@@ -405,33 +378,31 @@ public class MigrationService : IMigrationService
                 var r = await _zoho.AssociateCandidateWithJobAsync(
                     a.Candidate.ZohoCandidateId!, a.Job.ZohoJobId!, note, ct);
 
-                a.IsMigrated = r.Success;
-                a.ZohoApplicationId = r.ZohoId;
+                a.IsMigrated = r.Success; a.ZohoApplicationId = r.ZohoId;
                 a.MigratedAt = r.Success ? DateTime.UtcNow : null;
                 a.MigrationError = r.ErrorMessage;
                 WriteLog("Application", a.Id, a.OdooId, r);
                 if (r.Success) ok++; else fail++;
 
-                await Task.Delay(2000, ct); // Zoho rate limit
+                // configurable delay between each call
+                await Task.Delay(_cfg.ApplicationsDelayMs, ct);
             }
 
-            run.MigratedApplications = ok;
-            run.FailedApplications = fail;
+            run.MigratedApplications = ok; run.FailedApplications = fail;
             await _db.SaveChangesAsync(ct);
             cursor = batch.Max(a => a.Id);
-            _log.LogInformation("  Applications: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
-            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
+            _log.LogInformation("  Applications: {Ok}/{Total} synced, {Fail} failed (cursor={C})",
+                ok, run.TotalApplications, fail, cursor);
         }
     }
 
     // ================================================================
-    //  PHASE 5 — COMMENTS  (batch notes API)
+    //  PHASE 5 — COMMENTS  (batch notes)
     // ================================================================
 
     private async Task MigrateCommentsAsync(MigrationRun run, CancellationToken ct)
     {
         int ok = 0, fail = 0, cursor = 0;
-
         while (true)
         {
             var batch = await _db.ApplicationComments
@@ -440,7 +411,7 @@ public class MigrationService : IMigrationService
                     && c.Application.IsMigrated
                     && !string.IsNullOrEmpty(c.Application.Candidate.ZohoCandidateId))
                 .OrderBy(c => c.Id)
-                .Take(_cfg.BatchSize)
+                .Take(_cfg.CommentsBatchSize)
                 .ToListAsync(ct);
 
             if (batch.Count == 0) break;
@@ -452,7 +423,6 @@ public class MigrationService : IMigrationService
             )).ToList();
 
             var results = await _zoho.CreateNotesBatchAsync("Candidates", notes, ct);
-
             for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
                 batch[i].IsMigrated = results[i].Success;
@@ -464,18 +434,17 @@ public class MigrationService : IMigrationService
             await _db.SaveChangesAsync(ct);
             cursor = batch.Max(c => c.Id);
             _log.LogInformation("  Comments: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
-            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
+            await Task.Delay(_cfg.CommentsDelayMs, ct);
         }
     }
 
     // ================================================================
-    //  PHASE 6 — SUMMARIES  (batch notes API)
+    //  PHASE 6 — SUMMARIES  (batch notes)
     // ================================================================
 
     private async Task MigrateSummariesAsync(MigrationRun run, CancellationToken ct)
     {
         int ok = 0, fail = 0, cursor = 0;
-
         while (true)
         {
             var batch = await _db.ApplicationSummaries
@@ -484,7 +453,7 @@ public class MigrationService : IMigrationService
                     && s.Application != null && s.Application.IsMigrated
                     && !string.IsNullOrEmpty(s.Application.Candidate.ZohoCandidateId))
                 .OrderBy(s => s.Id)
-                .Take(_cfg.BatchSize)
+                .Take(_cfg.SummariesBatchSize)
                 .ToListAsync(ct);
 
             if (batch.Count == 0) break;
@@ -500,7 +469,6 @@ public class MigrationService : IMigrationService
             )).ToList();
 
             var results = await _zoho.CreateNotesBatchAsync("Candidates", notes, ct);
-
             for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
                 batch[i].IsMigrated = results[i].Success;
@@ -512,18 +480,17 @@ public class MigrationService : IMigrationService
             await _db.SaveChangesAsync(ct);
             cursor = batch.Max(s => s.Id);
             _log.LogInformation("  Summaries: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
-            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
+            await Task.Delay(_cfg.SummariesDelayMs, ct);
         }
     }
 
     // ================================================================
-    //  PHASE 7 — HISTORY  (batch notes API)
+    //  PHASE 7 — HISTORY  (batch notes)
     // ================================================================
 
     private async Task MigrateHistoryAsync(MigrationRun run, CancellationToken ct)
     {
         int ok = 0, fail = 0, cursor = 0;
-
         while (true)
         {
             var batch = await _db.ApplicationHistories
@@ -532,7 +499,7 @@ public class MigrationService : IMigrationService
                     && h.Application.IsMigrated
                     && !string.IsNullOrEmpty(h.Application.Candidate.ZohoCandidateId))
                 .OrderBy(h => h.Id)
-                .Take(_cfg.BatchSize)
+                .Take(_cfg.HistoryBatchSize)
                 .ToListAsync(ct);
 
             if (batch.Count == 0) break;
@@ -544,7 +511,6 @@ public class MigrationService : IMigrationService
             )).ToList();
 
             var results = await _zoho.CreateNotesBatchAsync("Candidates", notes, ct);
-
             for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
                 batch[i].IsMigrated = results[i].Success;
@@ -556,7 +522,7 @@ public class MigrationService : IMigrationService
             await _db.SaveChangesAsync(ct);
             cursor = batch.Max(h => h.Id);
             _log.LogInformation("  History: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
-            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
+            await Task.Delay(_cfg.HistoryDelayMs, ct);
         }
     }
 
@@ -568,8 +534,7 @@ public class MigrationService : IMigrationService
     {
         _db.MigrationLogs.Add(new MigrationLog
         {
-            EntityType = type, EntityId = id, OdooId = odooId,
-            ZohoId = r.ZohoId,
+            EntityType = type, EntityId = id, OdooId = odooId, ZohoId = r.ZohoId,
             Status = r.Success ? "Success" : "Failed",
             ErrorMessage = r.ErrorMessage, ErrorDetails = r.ErrorDetails,
             StartedAt = DateTime.UtcNow, CompletedAt = DateTime.UtcNow
@@ -578,48 +543,32 @@ public class MigrationService : IMigrationService
 
     private void LogFinalSummary(MigrationRun run)
     {
-        _log.LogInformation(
-            "╔══════════════════════════════════════════════════╗");
-        _log.LogInformation(
-            "║  Run {Id} {Status} in {Dur}                     ║",
-            run.Id, run.Status,
-            run.CompletedAt.HasValue
-                ? (run.CompletedAt.Value - run.StartedAt).ToString(@"hh\:mm\:ss")
-                : "?");
-        _log.LogInformation(
-            "║  Jobs     {M}/{T}  (failed {F})                 ║",
-            run.MigratedJobs, run.TotalJobs, run.FailedJobs);
-        _log.LogInformation(
-            "║  Cands    {M}/{T}  (failed {F})                 ║",
-            run.MigratedCandidates, run.TotalCandidates, run.FailedCandidates);
-        _log.LogInformation(
-            "║  Apps     {M}/{T}  (failed {F})                 ║",
-            run.MigratedApplications, run.TotalApplications, run.FailedApplications);
-        _log.LogInformation(
-            "║  CVs      {U}  (failed {F})                     ║",
-            run.TotalCvsUploaded, run.FailedCvUploads);
-        _log.LogInformation(
-            "╚══════════════════════════════════════════════════╝");
+        var dur = run.CompletedAt.HasValue
+            ? (run.CompletedAt.Value - run.StartedAt).ToString(@"hh\:mm\:ss") : "?";
+        _log.LogInformation("╔══════════════════════════════════════════════════════════════╗");
+        _log.LogInformation("║  Run {Id} {Status} in {Dur}                                  ║", run.Id, run.Status, dur);
+        _log.LogInformation("║  Jobs        {M}/{T}  (failed {F})                           ║", run.MigratedJobs, run.TotalJobs, run.FailedJobs);
+        _log.LogInformation("║  Candidates  {M}/{T}  (failed {F})                           ║", run.MigratedCandidates, run.TotalCandidates, run.FailedCandidates);
+        _log.LogInformation("║  Apps        {M}/{T}  (failed {F})                           ║", run.MigratedApplications, run.TotalApplications, run.FailedApplications);
+        _log.LogInformation("║  CVs         {U}  (failed {F})                               ║", run.TotalCvsUploaded, run.FailedCvUploads);
+        _log.LogInformation("╚══════════════════════════════════════════════════════════════╝");
     }
 
-    private async Task<int> PendingJobs(bool retry, CancellationToken ct) =>
-        await _db.Jobs.CountAsync(j => !j.IsMigrated && (retry || string.IsNullOrEmpty(j.MigrationError)), ct);
+    private async Task<int> PendingJobs(CancellationToken ct) =>
+        await _db.Jobs.CountAsync(j => !j.IsMigrated
+            && (_cfg.RetryFailed || string.IsNullOrEmpty(j.MigrationError)), ct);
 
-    private async Task<int> PendingCandidates(bool retry, CancellationToken ct) =>
+    private async Task<int> PendingCandidates(CancellationToken ct) =>
         await _db.Candidates.CountAsync(c => !c.IsMigrated && !string.IsNullOrEmpty(c.Email)
-            && (retry || string.IsNullOrEmpty(c.MigrationError)), ct);
+            && (_cfg.RetryFailed || string.IsNullOrEmpty(c.MigrationError)), ct);
 
-    private async Task<int> PendingApplications(bool retry, CancellationToken ct) =>
-        await _db.Applications
-            .Include(a => a.Candidate).Include(a => a.Job)
+    private async Task<int> PendingApplications(CancellationToken ct) =>
+        await _db.Applications.Include(a => a.Candidate).Include(a => a.Job)
             .CountAsync(a => !a.IsMigrated
                 && a.Candidate.IsMigrated && !string.IsNullOrEmpty(a.Candidate.ZohoCandidateId)
                 && a.Job.IsMigrated && !string.IsNullOrEmpty(a.Job.ZohoJobId)
-                && (retry || string.IsNullOrEmpty(a.MigrationError)), ct);
+                && (_cfg.RetryFailed || string.IsNullOrEmpty(a.MigrationError)), ct);
 
     private static string? GetFileNameFromUrl(string url)
-    {
-        try { return Path.GetFileName(new Uri(url).AbsolutePath); }
-        catch { return null; }
-    }
+    { try { return Path.GetFileName(new Uri(url).AbsolutePath); } catch { return null; } }
 }
