@@ -10,1301 +10,616 @@ using OdooToZohoMigration.Infrastructure.Data;
 namespace OdooToZohoMigration.Infrastructure.Services;
 
 /// <summary>
-/// Fully rewritten MigrationService with:
-/// - Cursor-based pagination (OrderBy Id, track lastProcessedId) for reliable resume
-/// - Index-based mapping of Zoho batch responses (no extra GET calls)
-/// - Concurrent CV uploads via SemaphoreSlim
-/// - Batch notes creation for comments/summaries/history
-/// - Per-entity MigrationLog entries for every operation
-/// - Incremental progress updates to MigrationRun after each batch
-/// - Comprehensive sync dashboard and entity-level status queries
-/// - Proper duplicate handling for candidates
+/// Config-driven migration service.  Set MigrationSettings.Enabled = true and run.
+/// All phases, batch sizes and retry behaviour come from appsettings.json.
+///
+/// Key optimisations vs. the original:
+///   - Cursor-based pagination  (OrderBy Id + lastProcessedId)
+///   - Index-based Zoho batch mapping  (no extra GET call per record)
+///   - Concurrent CV uploads  (SemaphoreSlim)
+///   - Batch notes API for comments / summaries / history
+///   - Every record written to MigrationLogs
+///   - MigrationRun counts updated after every batch
+///   - Duplicate candidates detected and all matching DB rows marked synced
 /// </summary>
 public class MigrationService : IMigrationService
 {
-    private readonly MigrationDbContext _dbContext;
-    private readonly IZohoRecruitService _zohoService;
-    private readonly IBlobStorageService _blobService;
-    private readonly MigrationSettings _settings;
-    private readonly ILogger<MigrationService> _logger;
-
-    private static readonly SemaphoreSlim _migrationLock = new(1, 1);
-    private static CancellationTokenSource? _currentMigrationCts;
+    private readonly MigrationDbContext _db;
+    private readonly IZohoRecruitService _zoho;
+    private readonly IBlobStorageService _blob;
+    private readonly MigrationSettings _cfg;
+    private readonly ILogger<MigrationService> _log;
 
     public MigrationService(
-        MigrationDbContext dbContext,
-        IZohoRecruitService zohoService,
-        IBlobStorageService blobService,
-        IOptions<MigrationSettings> settings,
-        ILogger<MigrationService> logger)
+        MigrationDbContext db,
+        IZohoRecruitService zoho,
+        IBlobStorageService blob,
+        IOptions<MigrationSettings> cfg,
+        ILogger<MigrationService> log)
     {
-        _dbContext = dbContext;
-        _zohoService = zohoService;
-        _blobService = blobService;
-        _settings = settings.Value;
-        _logger = logger;
+        _db = db;
+        _zoho = zoho;
+        _blob = blob;
+        _cfg = cfg.Value;
+        _log = log;
     }
 
-    // ========================================================================
-    // MIGRATION ORCHESTRATION
-    // ========================================================================
+    // ================================================================
+    //  PUBLIC ENTRY POINT
+    // ================================================================
 
-    public async Task<MigrationResultDto> StartMigrationAsync(
-        MigrationOptionsDto options,
-        CancellationToken cancellationToken = default)
+    public async Task RunAsync(CancellationToken ct = default)
     {
-        if (!await _migrationLock.WaitAsync(0, cancellationToken))
+        var run = new MigrationRun
         {
-            return new MigrationResultDto
-            {
-                Success = false,
-                Message = "A migration is already in progress. Check GET /api/migration/sync-dashboard for current status."
-            };
-        }
+            RunType = _cfg.RetryFailed ? "Retry" : "Full",
+            StartedAt = DateTime.UtcNow,
+            Status = "Running"
+        };
+
+        // ── count what needs doing ───────────────────────────────────
+        if (_cfg.MigrateJobs)
+            run.TotalJobs = await PendingJobs(_cfg.RetryFailed, ct);
+        if (_cfg.MigrateCandidates)
+            run.TotalCandidates = await PendingCandidates(_cfg.RetryFailed, ct);
+        if (_cfg.MigrateApplications)
+            run.TotalApplications = await PendingApplications(_cfg.RetryFailed, ct);
+
+        _db.MigrationRuns.Add(run);
+        await _db.SaveChangesAsync(ct);
+
+        _log.LogInformation(
+            "╔══════════════════════════════════════════════════╗");
+        _log.LogInformation(
+            "║  Migration Run {Id} — {Type}                    ║", run.Id, run.RunType);
+        _log.LogInformation(
+            "║  Jobs={J}  Candidates={C}  Apps={A}             ║",
+            run.TotalJobs, run.TotalCandidates, run.TotalApplications);
+        _log.LogInformation(
+            "╚══════════════════════════════════════════════════╝");
 
         try
         {
-            _currentMigrationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var ct = _currentMigrationCts.Token;
-
-            var batchSize = options.BatchSize > 0 ? options.BatchSize : _settings.DefaultBatchSize;
-            var concurrency = options.ConcurrencyLevel > 0 ? options.ConcurrencyLevel : _settings.MaxConcurrentCvUploads;
-
-            // Create migration run record
-            var run = new MigrationRun
+            // Phase 1 ─ Jobs
+            if (_cfg.MigrateJobs && run.TotalJobs > 0)
             {
-                RunType = options.RetryFailed ? "Retry" : "Full",
-                StartedAt = DateTime.UtcNow,
-                Status = "Running"
-            };
-
-            // Count totals for each enabled phase
-            if (options.MigrateJobs)
-                run.TotalJobs = await CountPendingAsync<Job>(options.RetryFailed, ct);
-            if (options.MigrateCandidates)
-                run.TotalCandidates = await CountPendingCandidatesAsync(options.RetryFailed, ct);
-            if (options.MigrateApplications)
-                run.TotalApplications = await CountPendingApplicationsAsync(options.RetryFailed, ct);
-
-            _dbContext.MigrationRuns.Add(run);
-            await _dbContext.SaveChangesAsync(ct);
-
-            _logger.LogInformation(
-                "Migration run {RunId} started. Type={RunType}, Jobs={Jobs}, Candidates={Candidates}, Apps={Apps}",
-                run.Id, run.RunType, run.TotalJobs, run.TotalCandidates, run.TotalApplications);
-
-            var summary = new MigrationRunSummaryDto();
-            var startTime = DateTime.UtcNow;
-
-            // Phase 1: Jobs
-            if (options.MigrateJobs && run.TotalJobs > 0)
-            {
-                _logger.LogInformation("=== Phase 1: Migrating {Count} jobs ===", run.TotalJobs);
-                var (migrated, failed) = await MigrateJobsBulkAsync(run, batchSize, options.RetryFailed, ct);
-                summary.JobsMigrated = migrated;
-                summary.JobsFailed = failed;
+                _log.LogInformation("▶ Phase 1/7: Jobs ({Count} pending)", run.TotalJobs);
+                await MigrateJobsAsync(run, ct);
             }
 
-            // Phase 2: Candidates
-            if (options.MigrateCandidates && run.TotalCandidates > 0)
+            // Phase 2 ─ Candidates
+            if (_cfg.MigrateCandidates && run.TotalCandidates > 0)
             {
-                _logger.LogInformation("=== Phase 2: Migrating {Count} candidates ===", run.TotalCandidates);
-                var (migrated, failed) = await MigrateCandidatesBulkAsync(run, batchSize, options.RetryFailed, ct);
-                summary.CandidatesMigrated = migrated;
-                summary.CandidatesFailed = failed;
+                _log.LogInformation("▶ Phase 2/7: Candidates ({Count} pending)", run.TotalCandidates);
+                await MigrateCandidatesAsync(run, ct);
             }
 
-            // Phase 3: CVs
-            if (options.MigrateCvs)
+            // Phase 3 ─ CVs
+            if (_cfg.MigrateCvs)
             {
-                _logger.LogInformation("=== Phase 3: Uploading CVs (concurrency={Concurrency}) ===", concurrency);
-                var (uploaded, failed) = await MigrateCvsConcurrentAsync(run, batchSize, concurrency, ct);
-                summary.CvsUploaded = uploaded;
-                summary.CvsFailed = failed;
+                var pending = await _db.Candidates.CountAsync(c =>
+                    c.IsMigrated && !c.IsCvMigrated
+                    && !string.IsNullOrEmpty(c.ResumeUrl)
+                    && !string.IsNullOrEmpty(c.ZohoCandidateId), ct);
+
+                if (pending > 0)
+                {
+                    _log.LogInformation("▶ Phase 3/7: CVs ({Count} pending, concurrency={C})",
+                        pending, _cfg.MaxConcurrentCvUploads);
+                    await MigrateCvsAsync(run, ct);
+                }
             }
 
-            // Phase 4: Applications
-            if (options.MigrateApplications && run.TotalApplications > 0)
+            // Phase 4 ─ Applications
+            if (_cfg.MigrateApplications && run.TotalApplications > 0)
             {
-                _logger.LogInformation("=== Phase 4: Migrating {Count} applications ===", run.TotalApplications);
-                var (migrated, failed) = await MigrateApplicationsBulkAsync(run, batchSize, options.RetryFailed, ct);
-                summary.ApplicationsMigrated = migrated;
-                summary.ApplicationsFailed = failed;
+                _log.LogInformation("▶ Phase 4/7: Applications ({Count} pending)", run.TotalApplications);
+                await MigrateApplicationsAsync(run, ct);
             }
 
-            // Phase 5: Comments (batch notes)
-            if (options.MigrateComments)
+            // Phase 5 ─ Comments
+            if (_cfg.MigrateComments)
             {
-                _logger.LogInformation("=== Phase 5: Migrating comments ===");
-                var (migrated, failed) = await MigrateCommentsBatchAsync(run, batchSize, ct);
-                summary.CommentsMigrated = migrated;
-                summary.CommentsFailed = failed;
+                var pending = await _db.ApplicationComments.CountAsync(c =>
+                    !c.IsMigrated && c.Application.IsMigrated
+                    && !string.IsNullOrEmpty(c.Application.Candidate.ZohoCandidateId), ct);
+
+                if (pending > 0)
+                {
+                    _log.LogInformation("▶ Phase 5/7: Comments ({Count} pending)", pending);
+                    await MigrateCommentsAsync(run, ct);
+                }
             }
 
-            // Phase 6: Summaries (batch notes)
-            if (options.MigrateSummaries)
+            // Phase 6 ─ Summaries
+            if (_cfg.MigrateSummaries)
             {
-                _logger.LogInformation("=== Phase 6: Migrating summaries ===");
-                var (migrated, failed) = await MigrateSummariesBatchAsync(run, batchSize, ct);
-                summary.SummariesMigrated = migrated;
-                summary.SummariesFailed = failed;
+                var pending = await _db.ApplicationSummaries.CountAsync(s =>
+                    !s.IsMigrated && s.Application != null && s.Application.IsMigrated
+                    && !string.IsNullOrEmpty(s.Application.Candidate.ZohoCandidateId), ct);
+
+                if (pending > 0)
+                {
+                    _log.LogInformation("▶ Phase 6/7: Summaries ({Count} pending)", pending);
+                    await MigrateSummariesAsync(run, ct);
+                }
             }
 
-            // Phase 7: History (batch notes)
-            if (options.MigrateHistory)
+            // Phase 7 ─ History
+            if (_cfg.MigrateHistory)
             {
-                _logger.LogInformation("=== Phase 7: Migrating history ===");
-                var (migrated, failed) = await MigrateHistoryBatchAsync(run, batchSize, ct);
-                summary.HistoryMigrated = migrated;
-                summary.HistoryFailed = failed;
+                var pending = await _db.ApplicationHistories.CountAsync(h =>
+                    !h.IsMigrated && h.Application.IsMigrated
+                    && !string.IsNullOrEmpty(h.Application.Candidate.ZohoCandidateId), ct);
+
+                if (pending > 0)
+                {
+                    _log.LogInformation("▶ Phase 7/7: History ({Count} pending)", pending);
+                    await MigrateHistoryAsync(run, ct);
+                }
             }
 
-            // Finalize
             run.Status = "Completed";
-            run.CompletedAt = DateTime.UtcNow;
-            summary.Duration = DateTime.UtcNow - startTime;
-            await _dbContext.SaveChangesAsync(ct);
-
-            _logger.LogInformation("Migration run {RunId} completed in {Duration}", run.Id, summary.Duration);
-
-            return new MigrationResultDto
-            {
-                Success = true,
-                RunId = run.Id,
-                Message = $"Migration completed in {summary.Duration:hh\\:mm\\:ss}. " +
-                          $"Jobs: {summary.JobsMigrated}/{run.TotalJobs}, " +
-                          $"Candidates: {summary.CandidatesMigrated}/{run.TotalCandidates}, " +
-                          $"Apps: {summary.ApplicationsMigrated}/{run.TotalApplications}, " +
-                          $"CVs: {summary.CvsUploaded}, Comments: {summary.CommentsMigrated}",
-                Summary = summary
-            };
         }
         catch (OperationCanceledException)
         {
-            _logger.LogWarning("Migration was cancelled");
-            return new MigrationResultDto { Success = false, Message = "Migration was cancelled by user" };
+            run.Status = "Cancelled";
+            _log.LogWarning("Migration run {Id} was cancelled.", run.Id);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Migration failed with unhandled exception");
-            return new MigrationResultDto { Success = false, Message = $"Migration failed: {ex.Message}" };
+            run.Status = "Failed";
+            run.Notes = ex.Message;
+            _log.LogError(ex, "Migration run {Id} failed.", run.Id);
         }
-        finally
-        {
-            _migrationLock.Release();
-            _currentMigrationCts = null;
-        }
+
+        run.CompletedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync(CancellationToken.None); // save even if cancelled
+
+        LogFinalSummary(run);
     }
 
-    // ========================================================================
-    // PHASE 1: JOBS - Bulk batch with cursor-based pagination
-    // ========================================================================
+    // ================================================================
+    //  PHASE 1 — JOBS  (batch create, index mapping)
+    // ================================================================
 
-    private async Task<(int Migrated, int Failed)> MigrateJobsBulkAsync(
-        MigrationRun run, int batchSize, bool retryFailed, CancellationToken ct)
+    private async Task MigrateJobsAsync(MigrationRun run, CancellationToken ct)
     {
-        int migrated = 0, failed = 0, lastProcessedId = 0;
+        int ok = 0, fail = 0, cursor = 0;
 
         while (true)
         {
-            var query = _dbContext.Jobs
-                .Where(j => !j.IsMigrated && j.Id > lastProcessedId)
-                .OrderBy(j => j.Id);
+            var batch = await _db.Jobs
+                .Where(j => !j.IsMigrated && j.Id > cursor
+                    && (_cfg.RetryFailed || string.IsNullOrEmpty(j.MigrationError)))
+                .OrderBy(j => j.Id)
+                .Take(_cfg.BatchSize)
+                .ToListAsync(ct);
 
-            if (!retryFailed)
-                query = (IOrderedQueryable<Job>)query.Where(j => string.IsNullOrEmpty(j.MigrationError));
+            if (batch.Count == 0) break;
 
-            var jobs = await query.Take(batchSize).ToListAsync(ct);
-            if (!jobs.Any()) break;
+            var results = await _zoho.CreateJobOpeningsBatchAsync(batch, ct);
 
-            // Send full batch to Zoho (up to 100 per API call)
-            var results = await _zohoService.CreateJobOpeningsBatchAsync(jobs, ct);
-
-            // Map results by index
-            for (int i = 0; i < jobs.Count && i < results.Count; i++)
+            for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
-                var job = jobs[i];
-                var result = results[i];
-
-                job.IsMigrated = result.Success;
-                job.ZohoJobId = result.ZohoId;
-                job.MigratedAt = result.Success ? DateTime.UtcNow : null;
-                job.MigrationError = result.ErrorMessage;
-
-                WriteMigrationLog("Job", job.Id, job.OdooId, result);
-
-                if (result.Success) migrated++;
-                else failed++;
+                var j = batch[i];
+                var r = results[i];
+                j.IsMigrated = r.Success;
+                j.ZohoJobId = r.ZohoId;
+                j.MigratedAt = r.Success ? DateTime.UtcNow : null;
+                j.MigrationError = r.ErrorMessage;
+                WriteLog("Job", j.Id, j.OdooId, r);
+                if (r.Success) ok++; else fail++;
             }
 
-            // Update run counts incrementally
-            run.MigratedJobs = migrated;
-            run.FailedJobs = failed;
-            await _dbContext.SaveChangesAsync(ct);
-
-            lastProcessedId = jobs.Max(j => j.Id);
-
-            _logger.LogInformation("Jobs batch done. Migrated={Migrated}, Failed={Failed}, LastId={LastId}",
-                migrated, failed, lastProcessedId);
-
-            await Task.Delay(_settings.DelayBetweenBatchesMs, ct);
+            run.MigratedJobs = ok;
+            run.FailedJobs = fail;
+            await _db.SaveChangesAsync(ct);
+            cursor = batch.Max(j => j.Id);
+            _log.LogInformation("  Jobs: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
+            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
-
-        return (migrated, failed);
     }
 
-    // ========================================================================
-    // PHASE 2: CANDIDATES - Bulk batch with index-based mapping, duplicate handling
-    // ========================================================================
+    // ================================================================
+    //  PHASE 2 — CANDIDATES  (batch create, duplicate handling)
+    // ================================================================
 
-    private async Task<(int Migrated, int Failed)> MigrateCandidatesBulkAsync(
-        MigrationRun run, int batchSize, bool retryFailed, CancellationToken ct)
+    private async Task MigrateCandidatesAsync(MigrationRun run, CancellationToken ct)
     {
-        int migrated = 0, failed = 0, lastProcessedId = 0;
+        int ok = 0, fail = 0, cursor = 0;
 
         while (true)
         {
-            // Fetch next batch using cursor-based pagination
-            var queryBase = _dbContext.Candidates
-                .Where(c => !c.IsMigrated && !string.IsNullOrEmpty(c.Email) && c.Id > lastProcessedId)
-                .OrderBy(c => c.Id);
+            var batch = await _db.Candidates
+                .Where(c => !c.IsMigrated && !string.IsNullOrEmpty(c.Email) && c.Id > cursor
+                    && (_cfg.RetryFailed || string.IsNullOrEmpty(c.MigrationError)))
+                .OrderBy(c => c.Id)
+                .Take(_cfg.BatchSize)
+                .ToListAsync(ct);
 
-            var candidates = await queryBase.Take(batchSize).ToListAsync(ct);
-            if (!candidates.Any()) break;
+            if (batch.Count == 0) break;
 
-            // Deduplicate by email within this batch (pick first occurrence)
-            var uniqueByEmail = candidates
+            // deduplicate within batch by email
+            var unique = batch
                 .GroupBy(c => c.Email!.ToLowerInvariant())
                 .Select(g => g.First())
                 .ToList();
 
-            // Send batch to Zoho - response is in SAME ORDER as input (index-based mapping)
-            var results = await _zohoService.CreateCandidatesBatchAsync(uniqueByEmail, ct);
+            // Zoho returns results in SAME ORDER as input → index mapping
+            var results = await _zoho.CreateCandidatesBatchAsync(unique, ct);
 
-            // Process results by index
-            for (int i = 0; i < uniqueByEmail.Count && i < results.Count; i++)
+            for (int i = 0; i < unique.Count && i < results.Count; i++)
             {
-                var candidate = uniqueByEmail[i];
-                var result = results[i];
+                var c = unique[i];
+                var r = results[i];
+                bool dup = r.ErrorMessage?.Contains("Duplicate", StringComparison.OrdinalIgnoreCase) == true;
 
-                bool isDuplicate = result.ErrorMessage?.Contains("Duplicate", StringComparison.OrdinalIgnoreCase) == true;
-
-                if (isDuplicate)
+                if (dup)
                 {
-                    // Mark ALL candidates with this email as migrated (handles duplicates in DB)
-                    var allWithEmail = await _dbContext.Candidates
-                        .Where(c => c.Email != null && c.Email.ToLower() == candidate.Email!.ToLower())
+                    // mark every DB row with same email as synced
+                    var all = await _db.Candidates
+                        .Where(x => x.Email != null
+                            && x.Email.ToLower() == c.Email!.ToLower())
                         .ToListAsync(ct);
-
-                    foreach (var dup in allWithEmail)
+                    foreach (var d in all)
                     {
-                        dup.IsMigrated = true;
-                        dup.MigratedAt = DateTime.UtcNow;
-                        dup.ZohoCandidateId = result.ZohoId;
-                        dup.MigrationError = null; // Clear any previous error - it's actually synced
+                        d.IsMigrated = true;
+                        d.MigratedAt = DateTime.UtcNow;
+                        d.ZohoCandidateId = r.ZohoId;
+                        d.MigrationError = null;
                     }
-                    migrated += allWithEmail.Count;
-
-                    _logger.LogInformation("Candidate {Email} already exists in Zoho (duplicate). Marked {Count} DB records as synced.",
-                        candidate.Email, allWithEmail.Count);
+                    ok += all.Count;
+                    _log.LogInformation("  Candidate {Email} duplicate in Zoho → {N} DB rows marked synced",
+                        c.Email, all.Count);
                 }
-                else if (result.Success)
+                else if (r.Success)
                 {
-                    candidate.IsMigrated = true;
-                    candidate.ZohoCandidateId = result.ZohoId;
-                    candidate.MigratedAt = DateTime.UtcNow;
-                    candidate.MigrationError = null;
-                    migrated++;
+                    c.IsMigrated = true;
+                    c.ZohoCandidateId = r.ZohoId;
+                    c.MigratedAt = DateTime.UtcNow;
+                    c.MigrationError = null;
+                    ok++;
                 }
                 else
                 {
-                    candidate.IsMigrated = false;
-                    candidate.MigrationError = result.ErrorMessage;
-                    failed++;
+                    c.MigrationError = r.ErrorMessage;
+                    fail++;
                 }
 
-                WriteMigrationLog("Candidate", candidate.Id, candidate.OdooId, result);
+                WriteLog("Candidate", c.Id, c.OdooId, r);
             }
 
-            // Update run counts incrementally
-            run.MigratedCandidates = migrated;
-            run.FailedCandidates = failed;
-            await _dbContext.SaveChangesAsync(ct);
-
-            lastProcessedId = candidates.Max(c => c.Id);
-
-            _logger.LogInformation("Candidates batch done. Migrated={Migrated}, Failed={Failed}, LastId={LastId}",
-                migrated, failed, lastProcessedId);
-
-            await Task.Delay(_settings.DelayBetweenBatchesMs, ct);
+            run.MigratedCandidates = ok;
+            run.FailedCandidates = fail;
+            await _db.SaveChangesAsync(ct);
+            cursor = batch.Max(c => c.Id);
+            _log.LogInformation("  Candidates: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
+            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
-
-        return (migrated, failed);
     }
 
-    // ========================================================================
-    // PHASE 3: CVs - Concurrent uploads with SemaphoreSlim
-    // ========================================================================
+    // ================================================================
+    //  PHASE 3 — CVs  (concurrent upload via SemaphoreSlim)
+    // ================================================================
 
-    private async Task<(int Uploaded, int Failed)> MigrateCvsConcurrentAsync(
-        MigrationRun run, int batchSize, int concurrency, CancellationToken ct)
+    private async Task MigrateCvsAsync(MigrationRun run, CancellationToken ct)
     {
-        int uploaded = 0, failed = 0, lastProcessedId = 0;
-        var semaphore = new SemaphoreSlim(concurrency);
+        int ok = 0, fail = 0, cursor = 0;
+        var sem = new SemaphoreSlim(_cfg.MaxConcurrentCvUploads);
 
         while (true)
         {
-            var candidates = await _dbContext.Candidates
-                .Where(c => c.IsMigrated
-                    && !c.IsCvMigrated
+            var batch = await _db.Candidates
+                .Where(c => c.IsMigrated && !c.IsCvMigrated
                     && !string.IsNullOrEmpty(c.ResumeUrl)
                     && !string.IsNullOrEmpty(c.ZohoCandidateId)
-                    && c.Id > lastProcessedId)
+                    && c.Id > cursor)
                 .OrderBy(c => c.Id)
-                .Take(batchSize)
+                .Take(_cfg.BatchSize)
                 .ToListAsync(ct);
 
-            if (!candidates.Any()) break;
+            if (batch.Count == 0) break;
 
-            // Process CV uploads concurrently within the batch
-            var tasks = candidates.Select(async candidate =>
+            var tasks = batch.Select(async c =>
             {
-                await semaphore.WaitAsync(ct);
+                await sem.WaitAsync(ct);
                 try
                 {
-                    var success = await UploadSingleCvAsync(candidate, ct);
-                    if (success) Interlocked.Increment(ref uploaded);
-                    else Interlocked.Increment(ref failed);
+                    if (await UploadOneCvAsync(c, ct))
+                        Interlocked.Increment(ref ok);
+                    else
+                        Interlocked.Increment(ref fail);
                 }
-                finally
-                {
-                    semaphore.Release();
-                }
+                finally { sem.Release(); }
             });
 
             await Task.WhenAll(tasks);
 
-            // Update run counts
-            run.TotalCvsUploaded = uploaded;
-            run.FailedCvUploads = failed;
-            await _dbContext.SaveChangesAsync(ct);
-
-            lastProcessedId = candidates.Max(c => c.Id);
-
-            _logger.LogInformation("CVs batch done. Uploaded={Uploaded}, Failed={Failed}, LastId={LastId}",
-                uploaded, failed, lastProcessedId);
-
-            await Task.Delay(_settings.DelayBetweenBatchesMs, ct);
+            run.TotalCvsUploaded = ok;
+            run.FailedCvUploads = fail;
+            await _db.SaveChangesAsync(ct);
+            cursor = batch.Max(c => c.Id);
+            _log.LogInformation("  CVs: {Ok} uploaded, {Fail} failed (cursor={C})", ok, fail, cursor);
+            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
-
-        return (uploaded, failed);
     }
 
-    private async Task<bool> UploadSingleCvAsync(Candidate candidate, CancellationToken ct)
+    private async Task<bool> UploadOneCvAsync(Candidate c, CancellationToken ct)
     {
         try
         {
-            var (stream, contentType, fileName) = await _blobService.GetCvWithMetadataAsync(candidate.ResumeUrl!, ct);
-
-            if (stream == null)
-            {
-                _logger.LogWarning("CV not found for candidate {Id}: {Url}", candidate.Id, candidate.ResumeUrl);
-                return false;
-            }
+            var (stream, contentType, fileName) = await _blob.GetCvWithMetadataAsync(c.ResumeUrl!, ct);
+            if (stream == null) return false;
 
             using (stream)
             {
-                var cvFileName = fileName ?? GetFileNameFromUrl(candidate.ResumeUrl!) ?? $"resume_{candidate.OdooId}.pdf";
-                var cvContentType = contentType ?? "application/pdf";
+                var fn = fileName ?? GetFileNameFromUrl(c.ResumeUrl!) ?? $"resume_{c.OdooId}.pdf";
+                var result = await _zoho.UploadCandidateCvAsync(
+                    c.ZohoCandidateId!, stream, fn, contentType ?? "application/pdf", ct);
 
-                var result = await _zohoService.UploadCandidateCvAsync(
-                    candidate.ZohoCandidateId!, stream, cvFileName, cvContentType, ct);
-
-                candidate.IsCvMigrated = result.Success;
-                candidate.CvMigratedAt = result.Success ? DateTime.UtcNow : null;
-
-                _logger.LogInformation("CV upload for candidate {Id}: {Status}",
-                    candidate.Id, result.Success ? "OK" : result.ErrorMessage);
-
+                c.IsCvMigrated = result.Success;
+                c.CvMigratedAt = result.Success ? DateTime.UtcNow : null;
                 return result.Success;
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error uploading CV for candidate {Id}", candidate.Id);
+            _log.LogError(ex, "CV upload failed for candidate {Id}", c.Id);
             return false;
         }
     }
 
-    // ========================================================================
-    // PHASE 4: APPLICATIONS - One-by-one (Zoho associate API limitation)
-    // ========================================================================
+    // ================================================================
+    //  PHASE 4 — APPLICATIONS  (associate API, 1-by-1 with throttle)
+    // ================================================================
 
-    private async Task<(int Migrated, int Failed)> MigrateApplicationsBulkAsync(
-        MigrationRun run, int batchSize, bool retryFailed, CancellationToken ct)
+    private async Task MigrateApplicationsAsync(MigrationRun run, CancellationToken ct)
     {
-        int migrated = 0, failed = 0, lastProcessedId = 0;
+        int ok = 0, fail = 0, cursor = 0;
 
         while (true)
         {
-            var query = _dbContext.Applications
+            var batch = await _db.Applications
                 .Include(a => a.Candidate)
                 .Include(a => a.Job)
-                .Where(a => !a.IsMigrated
-                    && a.Id > lastProcessedId
+                .Where(a => !a.IsMigrated && a.Id > cursor
                     && a.Candidate.IsMigrated
                     && !string.IsNullOrEmpty(a.Candidate.ZohoCandidateId)
                     && a.Job.IsMigrated
-                    && !string.IsNullOrEmpty(a.Job.ZohoJobId))
-                .OrderBy(a => a.Id);
+                    && !string.IsNullOrEmpty(a.Job.ZohoJobId)
+                    && (_cfg.RetryFailed || string.IsNullOrEmpty(a.MigrationError)))
+                .OrderBy(a => a.Id)
+                .Take(_cfg.BatchSize)
+                .ToListAsync(ct);
 
-            var apps = retryFailed
-                ? await query.Take(batchSize).ToListAsync(ct)
-                : await query.Where(a => string.IsNullOrEmpty(a.MigrationError)).Take(batchSize).ToListAsync(ct);
+            if (batch.Count == 0) break;
 
-            if (!apps.Any()) break;
-
-            foreach (var app in apps)
+            foreach (var a in batch)
             {
-                var comments = BuildApplicationComments(app);
+                var note = $"Applied {a.AppliedAt?.ToString("yyyy-MM-dd") ?? a.CreatedAt.ToString("yyyy-MM-dd")}. " +
+                           $"Status: {a.Status}. Priority: {a.Priority}";
+                if (!string.IsNullOrEmpty(a.CoverNote))
+                    note += $"\n\nCover Note: {a.CoverNote}";
 
-                var result = await _zohoService.AssociateCandidateWithJobAsync(
-                    app.Candidate.ZohoCandidateId!, app.Job.ZohoJobId!, comments, ct);
+                var r = await _zoho.AssociateCandidateWithJobAsync(
+                    a.Candidate.ZohoCandidateId!, a.Job.ZohoJobId!, note, ct);
 
-                app.IsMigrated = result.Success;
-                app.ZohoApplicationId = result.ZohoId;
-                app.MigratedAt = result.Success ? DateTime.UtcNow : null;
-                app.MigrationError = result.ErrorMessage;
+                a.IsMigrated = r.Success;
+                a.ZohoApplicationId = r.ZohoId;
+                a.MigratedAt = r.Success ? DateTime.UtcNow : null;
+                a.MigrationError = r.ErrorMessage;
+                WriteLog("Application", a.Id, a.OdooId, r);
+                if (r.Success) ok++; else fail++;
 
-                WriteMigrationLog("Application", app.Id, app.OdooId, result);
-
-                if (result.Success) migrated++;
-                else failed++;
-
-                // Zoho associate API: throttle 1 request per 2 seconds
-                await Task.Delay(2000, ct);
+                await Task.Delay(2000, ct); // Zoho rate limit
             }
 
-            run.MigratedApplications = migrated;
-            run.FailedApplications = failed;
-            await _dbContext.SaveChangesAsync(ct);
-
-            lastProcessedId = apps.Max(a => a.Id);
-
-            _logger.LogInformation("Applications batch done. Migrated={Migrated}, Failed={Failed}, LastId={LastId}",
-                migrated, failed, lastProcessedId);
-
-            await Task.Delay(_settings.DelayBetweenBatchesMs, ct);
+            run.MigratedApplications = ok;
+            run.FailedApplications = fail;
+            await _db.SaveChangesAsync(ct);
+            cursor = batch.Max(a => a.Id);
+            _log.LogInformation("  Applications: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
+            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
-
-        return (migrated, failed);
     }
 
-    // ========================================================================
-    // PHASE 5: COMMENTS - Batch notes creation
-    // ========================================================================
+    // ================================================================
+    //  PHASE 5 — COMMENTS  (batch notes API)
+    // ================================================================
 
-    private async Task<(int Migrated, int Failed)> MigrateCommentsBatchAsync(
-        MigrationRun run, int batchSize, CancellationToken ct)
+    private async Task MigrateCommentsAsync(MigrationRun run, CancellationToken ct)
     {
-        int migrated = 0, failed = 0, lastProcessedId = 0;
+        int ok = 0, fail = 0, cursor = 0;
 
         while (true)
         {
-            var comments = await _dbContext.ApplicationComments
-                .Include(c => c.Application)
-                    .ThenInclude(a => a.Candidate)
-                .Where(c => !c.IsMigrated
-                    && c.Id > lastProcessedId
+            var batch = await _db.ApplicationComments
+                .Include(c => c.Application).ThenInclude(a => a.Candidate)
+                .Where(c => !c.IsMigrated && c.Id > cursor
                     && c.Application.IsMigrated
                     && !string.IsNullOrEmpty(c.Application.Candidate.ZohoCandidateId))
                 .OrderBy(c => c.Id)
-                .Take(batchSize)
+                .Take(_cfg.BatchSize)
                 .ToListAsync(ct);
 
-            if (!comments.Any()) break;
+            if (batch.Count == 0) break;
 
-            // Build batch notes payload
-            var notePayloads = comments.Select(c => (
+            var notes = batch.Select(c => (
                 ParentId: c.Application.Candidate.ZohoCandidateId!,
                 Title: $"Comment - {c.CreatedAt:yyyy-MM-dd}",
                 Content: $"Author: {c.Author}\nDate: {c.CreatedAt:yyyy-MM-dd HH:mm}\n\n{c.Body}"
             )).ToList();
 
-            var results = await _zohoService.CreateNotesBatchAsync("Candidates", notePayloads, ct);
+            var results = await _zoho.CreateNotesBatchAsync("Candidates", notes, ct);
 
-            for (int i = 0; i < comments.Count && i < results.Count; i++)
+            for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
-                var comment = comments[i];
-                var result = results[i];
-
-                comment.IsMigrated = result.Success;
-                comment.ZohoNoteId = result.ZohoId;
-                comment.MigratedAt = result.Success ? DateTime.UtcNow : null;
-
-                if (result.Success) migrated++;
-                else failed++;
+                batch[i].IsMigrated = results[i].Success;
+                batch[i].ZohoNoteId = results[i].ZohoId;
+                batch[i].MigratedAt = results[i].Success ? DateTime.UtcNow : null;
+                if (results[i].Success) ok++; else fail++;
             }
 
-            await _dbContext.SaveChangesAsync(ct);
-            lastProcessedId = comments.Max(c => c.Id);
-
-            _logger.LogInformation("Comments batch done. Migrated={Migrated}, Failed={Failed}, LastId={LastId}",
-                migrated, failed, lastProcessedId);
-
-            await Task.Delay(_settings.DelayBetweenBatchesMs, ct);
+            await _db.SaveChangesAsync(ct);
+            cursor = batch.Max(c => c.Id);
+            _log.LogInformation("  Comments: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
+            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
-
-        return (migrated, failed);
     }
 
-    // ========================================================================
-    // PHASE 6: SUMMARIES - Batch notes creation
-    // ========================================================================
+    // ================================================================
+    //  PHASE 6 — SUMMARIES  (batch notes API)
+    // ================================================================
 
-    private async Task<(int Migrated, int Failed)> MigrateSummariesBatchAsync(
-        MigrationRun run, int batchSize, CancellationToken ct)
+    private async Task MigrateSummariesAsync(MigrationRun run, CancellationToken ct)
     {
-        int migrated = 0, failed = 0, lastProcessedId = 0;
+        int ok = 0, fail = 0, cursor = 0;
 
         while (true)
         {
-            var summaries = await _dbContext.ApplicationSummaries
-                .Include(s => s.Application)
-                    .ThenInclude(a => a!.Candidate)
-                .Where(s => !s.IsMigrated
-                    && s.Id > lastProcessedId
-                    && s.Application != null
-                    && s.Application.IsMigrated
+            var batch = await _db.ApplicationSummaries
+                .Include(s => s.Application).ThenInclude(a => a!.Candidate)
+                .Where(s => !s.IsMigrated && s.Id > cursor
+                    && s.Application != null && s.Application.IsMigrated
                     && !string.IsNullOrEmpty(s.Application.Candidate.ZohoCandidateId))
                 .OrderBy(s => s.Id)
-                .Take(batchSize)
+                .Take(_cfg.BatchSize)
                 .ToListAsync(ct);
 
-            if (!summaries.Any()) break;
+            if (batch.Count == 0) break;
 
-            var notePayloads = summaries.Select(s => (
+            var notes = batch.Select(s => (
                 ParentId: s.Application!.Candidate.ZohoCandidateId!,
                 Title: "Application Summary",
-                Content: $"=== Application Summary ===\n\n" +
-                    $"Expected Salary: {s.ExpectedSalary:N2}\n" +
-                    $"Proposed Salary: {s.ProposedSalary:N2}\n" +
-                    $"Availability Date: {s.AvailabilityDate:yyyy-MM-dd}\n" +
-                    $"Priority: {s.Priority}\n" +
-                    $"Source: {s.Source}\n" +
-                    $"Degree: {s.Degree}\n" +
-                    $"Recruiter: {s.Recruiter}"
+                Content: $"Expected Salary: {s.ExpectedSalary:N2}\n" +
+                         $"Proposed Salary: {s.ProposedSalary:N2}\n" +
+                         $"Availability: {s.AvailabilityDate:yyyy-MM-dd}\n" +
+                         $"Priority: {s.Priority}\nSource: {s.Source}\n" +
+                         $"Degree: {s.Degree}\nRecruiter: {s.Recruiter}"
             )).ToList();
 
-            var results = await _zohoService.CreateNotesBatchAsync("Candidates", notePayloads, ct);
+            var results = await _zoho.CreateNotesBatchAsync("Candidates", notes, ct);
 
-            for (int i = 0; i < summaries.Count && i < results.Count; i++)
+            for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
-                var summary = summaries[i];
-                var result = results[i];
-
-                summary.IsMigrated = result.Success;
-                summary.ZohoNoteId = result.ZohoId;
-                summary.MigratedAt = result.Success ? DateTime.UtcNow : null;
-
-                if (result.Success) migrated++;
-                else failed++;
+                batch[i].IsMigrated = results[i].Success;
+                batch[i].ZohoNoteId = results[i].ZohoId;
+                batch[i].MigratedAt = results[i].Success ? DateTime.UtcNow : null;
+                if (results[i].Success) ok++; else fail++;
             }
 
-            await _dbContext.SaveChangesAsync(ct);
-            lastProcessedId = summaries.Max(s => s.Id);
-
-            _logger.LogInformation("Summaries batch done. Migrated={Migrated}, Failed={Failed}, LastId={LastId}",
-                migrated, failed, lastProcessedId);
-
-            await Task.Delay(_settings.DelayBetweenBatchesMs, ct);
+            await _db.SaveChangesAsync(ct);
+            cursor = batch.Max(s => s.Id);
+            _log.LogInformation("  Summaries: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
+            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
-
-        return (migrated, failed);
     }
 
-    // ========================================================================
-    // PHASE 7: HISTORY - Batch notes creation
-    // ========================================================================
+    // ================================================================
+    //  PHASE 7 — HISTORY  (batch notes API)
+    // ================================================================
 
-    private async Task<(int Migrated, int Failed)> MigrateHistoryBatchAsync(
-        MigrationRun run, int batchSize, CancellationToken ct)
+    private async Task MigrateHistoryAsync(MigrationRun run, CancellationToken ct)
     {
-        int migrated = 0, failed = 0, lastProcessedId = 0;
+        int ok = 0, fail = 0, cursor = 0;
 
         while (true)
         {
-            var history = await _dbContext.ApplicationHistories
-                .Include(h => h.Application)
-                    .ThenInclude(a => a.Candidate)
-                .Where(h => !h.IsMigrated
-                    && h.Id > lastProcessedId
+            var batch = await _db.ApplicationHistories
+                .Include(h => h.Application).ThenInclude(a => a.Candidate)
+                .Where(h => !h.IsMigrated && h.Id > cursor
                     && h.Application.IsMigrated
                     && !string.IsNullOrEmpty(h.Application.Candidate.ZohoCandidateId))
                 .OrderBy(h => h.Id)
-                .Take(batchSize)
+                .Take(_cfg.BatchSize)
                 .ToListAsync(ct);
 
-            if (!history.Any()) break;
+            if (batch.Count == 0) break;
 
-            var notePayloads = history.Select(h => (
+            var notes = batch.Select(h => (
                 ParentId: h.Application.Candidate.ZohoCandidateId!,
                 Title: $"History - {h.ChangeDate:yyyy-MM-dd}",
                 Content: $"Stage Change: {h.ChangeDate:yyyy-MM-dd HH:mm}\n\n{h.Description}"
             )).ToList();
 
-            var results = await _zohoService.CreateNotesBatchAsync("Candidates", notePayloads, ct);
+            var results = await _zoho.CreateNotesBatchAsync("Candidates", notes, ct);
 
-            for (int i = 0; i < history.Count && i < results.Count; i++)
+            for (int i = 0; i < batch.Count && i < results.Count; i++)
             {
-                var item = history[i];
-                var result = results[i];
-
-                item.IsMigrated = result.Success;
-                item.ZohoNoteId = result.ZohoId;
-                item.MigratedAt = result.Success ? DateTime.UtcNow : null;
-
-                if (result.Success) migrated++;
-                else failed++;
+                batch[i].IsMigrated = results[i].Success;
+                batch[i].ZohoNoteId = results[i].ZohoId;
+                batch[i].MigratedAt = results[i].Success ? DateTime.UtcNow : null;
+                if (results[i].Success) ok++; else fail++;
             }
 
-            await _dbContext.SaveChangesAsync(ct);
-            lastProcessedId = history.Max(h => h.Id);
-
-            _logger.LogInformation("History batch done. Migrated={Migrated}, Failed={Failed}, LastId={LastId}",
-                migrated, failed, lastProcessedId);
-
-            await Task.Delay(_settings.DelayBetweenBatchesMs, ct);
-        }
-
-        return (migrated, failed);
-    }
-
-    // ========================================================================
-    // SYNC DASHBOARD - Comprehensive view of all entity sync states
-    // ========================================================================
-
-    public async Task<SyncDashboardDto> GetSyncDashboardAsync(CancellationToken ct = default)
-    {
-        var dashboard = new SyncDashboardDto();
-
-        // Jobs
-        var totalJobs = await _dbContext.Jobs.CountAsync(ct);
-        var syncedJobs = await _dbContext.Jobs.CountAsync(j => j.IsMigrated, ct);
-        var failedJobs = await _dbContext.Jobs.CountAsync(j => !j.IsMigrated && !string.IsNullOrEmpty(j.MigrationError), ct);
-        var lastJobSync = await _dbContext.Jobs.Where(j => j.MigratedAt != null).MaxAsync(j => (DateTime?)j.MigratedAt, ct);
-        dashboard.Jobs = new EntitySyncOverview
-        {
-            EntityType = "Jobs", Total = totalJobs, Synced = syncedJobs,
-            Pending = totalJobs - syncedJobs - failedJobs, Failed = failedJobs, LastSyncedAt = lastJobSync
-        };
-
-        // Candidates
-        var totalCandidates = await _dbContext.Candidates.CountAsync(ct);
-        var syncedCandidates = await _dbContext.Candidates.CountAsync(c => c.IsMigrated, ct);
-        var failedCandidates = await _dbContext.Candidates.CountAsync(c => !c.IsMigrated && !string.IsNullOrEmpty(c.MigrationError), ct);
-        var lastCandidateSync = await _dbContext.Candidates.Where(c => c.MigratedAt != null).MaxAsync(c => (DateTime?)c.MigratedAt, ct);
-        dashboard.Candidates = new EntitySyncOverview
-        {
-            EntityType = "Candidates", Total = totalCandidates, Synced = syncedCandidates,
-            Pending = totalCandidates - syncedCandidates - failedCandidates, Failed = failedCandidates, LastSyncedAt = lastCandidateSync
-        };
-
-        // CVs
-        var totalWithCv = await _dbContext.Candidates.CountAsync(c => c.IsMigrated && !string.IsNullOrEmpty(c.ResumeUrl), ct);
-        var cvUploaded = await _dbContext.Candidates.CountAsync(c => c.IsCvMigrated, ct);
-        var pendingCvUploads = await _dbContext.Candidates.CountAsync(c => c.IsMigrated && !c.IsCvMigrated && !string.IsNullOrEmpty(c.ResumeUrl) && !string.IsNullOrEmpty(c.ZohoCandidateId), ct);
-        var noCvAvailable = await _dbContext.Candidates.CountAsync(c => c.IsMigrated && string.IsNullOrEmpty(c.ResumeUrl), ct);
-        var lastCvSync = await _dbContext.Candidates.Where(c => c.CvMigratedAt != null).MaxAsync(c => (DateTime?)c.CvMigratedAt, ct);
-        dashboard.CandidateCvs = new CandidateCvSyncOverview
-        {
-            EntityType = "CVs", Total = totalWithCv, Synced = cvUploaded,
-            Pending = pendingCvUploads, Failed = totalWithCv - cvUploaded - pendingCvUploads,
-            PendingCvUploads = pendingCvUploads, NoCvAvailable = noCvAvailable, LastSyncedAt = lastCvSync
-        };
-
-        // Applications
-        var totalApps = await _dbContext.Applications.CountAsync(ct);
-        var syncedApps = await _dbContext.Applications.CountAsync(a => a.IsMigrated, ct);
-        var failedApps = await _dbContext.Applications.CountAsync(a => !a.IsMigrated && !string.IsNullOrEmpty(a.MigrationError), ct);
-        var lastAppSync = await _dbContext.Applications.Where(a => a.MigratedAt != null).MaxAsync(a => (DateTime?)a.MigratedAt, ct);
-        dashboard.Applications = new EntitySyncOverview
-        {
-            EntityType = "Applications", Total = totalApps, Synced = syncedApps,
-            Pending = totalApps - syncedApps - failedApps, Failed = failedApps, LastSyncedAt = lastAppSync
-        };
-
-        // Comments
-        var totalComments = await _dbContext.ApplicationComments.CountAsync(ct);
-        var syncedComments = await _dbContext.ApplicationComments.CountAsync(c => c.IsMigrated, ct);
-        var lastCommentSync = await _dbContext.ApplicationComments.Where(c => c.MigratedAt != null).MaxAsync(c => (DateTime?)c.MigratedAt, ct);
-        dashboard.Comments = new EntitySyncOverview
-        {
-            EntityType = "Comments", Total = totalComments, Synced = syncedComments,
-            Pending = totalComments - syncedComments, Failed = 0, LastSyncedAt = lastCommentSync
-        };
-
-        // Summaries
-        var totalSummaries = await _dbContext.ApplicationSummaries.CountAsync(ct);
-        var syncedSummaries = await _dbContext.ApplicationSummaries.CountAsync(s => s.IsMigrated, ct);
-        var lastSummarySync = await _dbContext.ApplicationSummaries.Where(s => s.MigratedAt != null).MaxAsync(s => (DateTime?)s.MigratedAt, ct);
-        dashboard.Summaries = new EntitySyncOverview
-        {
-            EntityType = "Summaries", Total = totalSummaries, Synced = syncedSummaries,
-            Pending = totalSummaries - syncedSummaries, Failed = 0, LastSyncedAt = lastSummarySync
-        };
-
-        // History
-        var totalHistory = await _dbContext.ApplicationHistories.CountAsync(ct);
-        var syncedHistory = await _dbContext.ApplicationHistories.CountAsync(h => h.IsMigrated, ct);
-        var lastHistorySync = await _dbContext.ApplicationHistories.Where(h => h.MigratedAt != null).MaxAsync(h => (DateTime?)h.MigratedAt, ct);
-        dashboard.History = new EntitySyncOverview
-        {
-            EntityType = "History", Total = totalHistory, Synced = syncedHistory,
-            Pending = totalHistory - syncedHistory, Failed = 0, LastSyncedAt = lastHistorySync
-        };
-
-        // Totals
-        dashboard.TotalRecords = totalJobs + totalCandidates + totalApps + totalComments + totalSummaries + totalHistory;
-        dashboard.TotalSynced = syncedJobs + syncedCandidates + syncedApps + syncedComments + syncedSummaries + syncedHistory;
-        dashboard.TotalPending = dashboard.TotalRecords - dashboard.TotalSynced - (failedJobs + failedCandidates + failedApps);
-        dashboard.TotalFailed = failedJobs + failedCandidates + failedApps;
-
-        // Last run info
-        var lastRun = await _dbContext.MigrationRuns
-            .OrderByDescending(r => r.StartedAt)
-            .FirstOrDefaultAsync(ct);
-
-        if (lastRun != null)
-        {
-            dashboard.LastRun = new LastRunInfo
-            {
-                RunId = lastRun.Id,
-                Status = lastRun.Status,
-                StartedAt = lastRun.StartedAt,
-                CompletedAt = lastRun.CompletedAt,
-                RunType = lastRun.RunType
-            };
-        }
-
-        return dashboard;
-    }
-
-    // ========================================================================
-    // SYNC STATUS - Entity-level detail with pagination and filtering
-    // ========================================================================
-
-    public async Task<PagedSyncResultDto> GetSyncStatusAsync(
-        string entityType, SyncStatusQueryDto query, CancellationToken ct = default)
-    {
-        return entityType.ToLowerInvariant() switch
-        {
-            "jobs" => await GetJobsSyncStatusAsync(query, ct),
-            "candidates" => await GetCandidatesSyncStatusAsync(query, ct),
-            "applications" => await GetApplicationsSyncStatusAsync(query, ct),
-            "cvs" => await GetCvsSyncStatusAsync(query, ct),
-            "comments" => await GetCommentsSyncStatusAsync(query, ct),
-            "summaries" => await GetSummariesSyncStatusAsync(query, ct),
-            "history" => await GetHistorySyncStatusAsync(query, ct),
-            _ => new PagedSyncResultDto { EntityType = entityType, Items = new(), TotalCount = 0 }
-        };
-    }
-
-    private async Task<PagedSyncResultDto> GetJobsSyncStatusAsync(SyncStatusQueryDto query, CancellationToken ct)
-    {
-        var q = _dbContext.Jobs.AsQueryable();
-        q = ApplySyncFilter(q, query.Filter, j => j.IsMigrated, j => j.MigrationError);
-
-        if (!string.IsNullOrWhiteSpace(query.Search))
-            q = q.Where(j => j.Title.Contains(query.Search));
-
-        if (!string.IsNullOrWhiteSpace(query.ErrorFilter))
-            q = q.Where(j => j.MigrationError != null && j.MigrationError.Contains(query.ErrorFilter));
-
-        var totalCount = await q.CountAsync(ct);
-        var items = await q.OrderBy(j => j.Id)
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .Select(j => new SyncEntityDetailDto
-            {
-                Id = j.Id,
-                OdooId = j.OdooId,
-                Name = j.Title,
-                SyncStatus = j.IsMigrated ? "Synced" : (!string.IsNullOrEmpty(j.MigrationError) ? "Failed" : "Pending"),
-                ZohoId = j.ZohoJobId,
-                SyncedAt = j.MigratedAt,
-                ErrorMessage = j.MigrationError,
-                AdditionalInfo = j.Department
-            })
-            .ToListAsync(ct);
-
-        return new PagedSyncResultDto
-        {
-            EntityType = "Jobs", Items = items, TotalCount = totalCount,
-            Page = query.Page, PageSize = query.PageSize, Filter = query.Filter
-        };
-    }
-
-    private async Task<PagedSyncResultDto> GetCandidatesSyncStatusAsync(SyncStatusQueryDto query, CancellationToken ct)
-    {
-        var q = _dbContext.Candidates.AsQueryable();
-        q = ApplySyncFilter(q, query.Filter, c => c.IsMigrated, c => c.MigrationError);
-
-        if (!string.IsNullOrWhiteSpace(query.Search))
-            q = q.Where(c => c.Name.Contains(query.Search) || (c.Email != null && c.Email.Contains(query.Search)));
-
-        if (!string.IsNullOrWhiteSpace(query.ErrorFilter))
-            q = q.Where(c => c.MigrationError != null && c.MigrationError.Contains(query.ErrorFilter));
-
-        var totalCount = await q.CountAsync(ct);
-        var items = await q.OrderBy(c => c.Id)
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .Select(c => new SyncEntityDetailDto
-            {
-                Id = c.Id,
-                OdooId = c.OdooId,
-                Name = c.Name,
-                Email = c.Email,
-                SyncStatus = c.IsMigrated ? "Synced" : (!string.IsNullOrEmpty(c.MigrationError) ? "Failed" : "Pending"),
-                ZohoId = c.ZohoCandidateId,
-                SyncedAt = c.MigratedAt,
-                ErrorMessage = c.MigrationError,
-                AdditionalInfo = c.IsCvMigrated ? "CV: Uploaded" : (string.IsNullOrEmpty(c.ResumeUrl) ? "CV: None" : "CV: Pending")
-            })
-            .ToListAsync(ct);
-
-        return new PagedSyncResultDto
-        {
-            EntityType = "Candidates", Items = items, TotalCount = totalCount,
-            Page = query.Page, PageSize = query.PageSize, Filter = query.Filter
-        };
-    }
-
-    private async Task<PagedSyncResultDto> GetApplicationsSyncStatusAsync(SyncStatusQueryDto query, CancellationToken ct)
-    {
-        var q = _dbContext.Applications.Include(a => a.Candidate).Include(a => a.Job).AsQueryable();
-        q = ApplySyncFilter(q, query.Filter, a => a.IsMigrated, a => a.MigrationError);
-
-        if (!string.IsNullOrWhiteSpace(query.Search))
-            q = q.Where(a => a.Candidate.Name.Contains(query.Search) || a.Job.Title.Contains(query.Search));
-
-        var totalCount = await q.CountAsync(ct);
-        var items = await q.OrderBy(a => a.Id)
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .Select(a => new SyncEntityDetailDto
-            {
-                Id = a.Id,
-                OdooId = a.OdooId,
-                Name = a.Candidate.Name + " -> " + a.Job.Title,
-                Email = a.Candidate.Email,
-                SyncStatus = a.IsMigrated ? "Synced" : (!string.IsNullOrEmpty(a.MigrationError) ? "Failed" : "Pending"),
-                ZohoId = a.ZohoApplicationId,
-                SyncedAt = a.MigratedAt,
-                ErrorMessage = a.MigrationError,
-                AdditionalInfo = $"Status: {a.Status}"
-            })
-            .ToListAsync(ct);
-
-        return new PagedSyncResultDto
-        {
-            EntityType = "Applications", Items = items, TotalCount = totalCount,
-            Page = query.Page, PageSize = query.PageSize, Filter = query.Filter
-        };
-    }
-
-    private async Task<PagedSyncResultDto> GetCvsSyncStatusAsync(SyncStatusQueryDto query, CancellationToken ct)
-    {
-        var q = _dbContext.Candidates
-            .Where(c => c.IsMigrated && !string.IsNullOrEmpty(c.ResumeUrl))
-            .AsQueryable();
-
-        q = query.Filter?.ToLowerInvariant() switch
-        {
-            "synced" => q.Where(c => c.IsCvMigrated),
-            "pending" => q.Where(c => !c.IsCvMigrated),
-            _ => q
-        };
-
-        if (!string.IsNullOrWhiteSpace(query.Search))
-            q = q.Where(c => c.Name.Contains(query.Search) || (c.Email != null && c.Email.Contains(query.Search)));
-
-        var totalCount = await q.CountAsync(ct);
-        var items = await q.OrderBy(c => c.Id)
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .Select(c => new SyncEntityDetailDto
-            {
-                Id = c.Id,
-                OdooId = c.OdooId,
-                Name = c.Name,
-                Email = c.Email,
-                SyncStatus = c.IsCvMigrated ? "Synced" : "Pending",
-                ZohoId = c.ZohoCandidateId,
-                SyncedAt = c.CvMigratedAt,
-                AdditionalInfo = c.ResumeUrl
-            })
-            .ToListAsync(ct);
-
-        return new PagedSyncResultDto
-        {
-            EntityType = "CVs", Items = items, TotalCount = totalCount,
-            Page = query.Page, PageSize = query.PageSize, Filter = query.Filter ?? "all"
-        };
-    }
-
-    private async Task<PagedSyncResultDto> GetCommentsSyncStatusAsync(SyncStatusQueryDto query, CancellationToken ct)
-    {
-        var q = _dbContext.ApplicationComments.AsQueryable();
-        q = query.Filter?.ToLowerInvariant() switch
-        {
-            "synced" => q.Where(c => c.IsMigrated),
-            "pending" => q.Where(c => !c.IsMigrated),
-            _ => q
-        };
-
-        var totalCount = await q.CountAsync(ct);
-        var items = await q.OrderBy(c => c.Id)
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .Select(c => new SyncEntityDetailDto
-            {
-                Id = c.Id,
-                OdooId = c.ApplicationOdooId,
-                Name = c.Author,
-                SyncStatus = c.IsMigrated ? "Synced" : "Pending",
-                ZohoId = c.ZohoNoteId,
-                SyncedAt = c.MigratedAt,
-                AdditionalInfo = c.Body.Length > 100 ? c.Body.Substring(0, 100) + "..." : c.Body
-            })
-            .ToListAsync(ct);
-
-        return new PagedSyncResultDto
-        {
-            EntityType = "Comments", Items = items, TotalCount = totalCount,
-            Page = query.Page, PageSize = query.PageSize, Filter = query.Filter ?? "all"
-        };
-    }
-
-    private async Task<PagedSyncResultDto> GetSummariesSyncStatusAsync(SyncStatusQueryDto query, CancellationToken ct)
-    {
-        var q = _dbContext.ApplicationSummaries.AsQueryable();
-        q = query.Filter?.ToLowerInvariant() switch
-        {
-            "synced" => q.Where(s => s.IsMigrated),
-            "pending" => q.Where(s => !s.IsMigrated),
-            _ => q
-        };
-
-        var totalCount = await q.CountAsync(ct);
-        var items = await q.OrderBy(s => s.Id)
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .Select(s => new SyncEntityDetailDto
-            {
-                Id = s.Id,
-                OdooId = s.ApplicationOdooId,
-                Name = $"Summary (Recruiter: {s.Recruiter})",
-                SyncStatus = s.IsMigrated ? "Synced" : "Pending",
-                ZohoId = s.ZohoNoteId,
-                SyncedAt = s.MigratedAt,
-                AdditionalInfo = $"Salary: {s.ExpectedSalary:N0}, Source: {s.Source}"
-            })
-            .ToListAsync(ct);
-
-        return new PagedSyncResultDto
-        {
-            EntityType = "Summaries", Items = items, TotalCount = totalCount,
-            Page = query.Page, PageSize = query.PageSize, Filter = query.Filter ?? "all"
-        };
-    }
-
-    private async Task<PagedSyncResultDto> GetHistorySyncStatusAsync(SyncStatusQueryDto query, CancellationToken ct)
-    {
-        var q = _dbContext.ApplicationHistories.AsQueryable();
-        q = query.Filter?.ToLowerInvariant() switch
-        {
-            "synced" => q.Where(h => h.IsMigrated),
-            "pending" => q.Where(h => !h.IsMigrated),
-            _ => q
-        };
-
-        var totalCount = await q.CountAsync(ct);
-        var items = await q.OrderBy(h => h.Id)
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .Select(h => new SyncEntityDetailDto
-            {
-                Id = h.Id,
-                OdooId = h.ApplicationOdooId,
-                Name = $"History - {h.ChangeDate:yyyy-MM-dd}",
-                SyncStatus = h.IsMigrated ? "Synced" : "Pending",
-                ZohoId = h.ZohoNoteId,
-                SyncedAt = h.MigratedAt,
-                AdditionalInfo = h.Description.Length > 100 ? h.Description.Substring(0, 100) + "..." : h.Description
-            })
-            .ToListAsync(ct);
-
-        return new PagedSyncResultDto
-        {
-            EntityType = "History", Items = items, TotalCount = totalCount,
-            Page = query.Page, PageSize = query.PageSize, Filter = query.Filter ?? "all"
-        };
-    }
-
-    // ========================================================================
-    // OTHER PUBLIC METHODS
-    // ========================================================================
-
-    public async Task<MigrationStatusDto?> GetMigrationStatusAsync(int runId, CancellationToken ct = default)
-    {
-        var run = await _dbContext.MigrationRuns.FindAsync(new object[] { runId }, ct);
-        if (run == null) return null;
-
-        return MapRunToStatus(run);
-    }
-
-    public async Task<MigrationSummaryDto> GetMigrationSummaryAsync(CancellationToken ct = default)
-    {
-        var runs = await _dbContext.MigrationRuns.ToListAsync(ct);
-        var lastRun = runs.OrderByDescending(r => r.StartedAt).FirstOrDefault();
-
-        // Get CV counts
-        var cvTotal = await _dbContext.Candidates.CountAsync(c => c.IsMigrated && !string.IsNullOrEmpty(c.ResumeUrl), ct);
-        var cvMigrated = await _dbContext.Candidates.CountAsync(c => c.IsCvMigrated, ct);
-        var cvPending = await _dbContext.Candidates.CountAsync(c => c.IsMigrated && !c.IsCvMigrated && !string.IsNullOrEmpty(c.ResumeUrl), ct);
-
-        // Get comments counts
-        var commentTotal = await _dbContext.ApplicationComments.CountAsync(ct);
-        var commentMigrated = await _dbContext.ApplicationComments.CountAsync(c => c.IsMigrated, ct);
-
-        // Get summaries counts
-        var summaryTotal = await _dbContext.ApplicationSummaries.CountAsync(ct);
-        var summaryMigrated = await _dbContext.ApplicationSummaries.CountAsync(s => s.IsMigrated, ct);
-
-        // Get history counts
-        var historyTotal = await _dbContext.ApplicationHistories.CountAsync(ct);
-        var historyMigrated = await _dbContext.ApplicationHistories.CountAsync(h => h.IsMigrated, ct);
-
-        return new MigrationSummaryDto
-        {
-            TotalRuns = runs.Count,
-            SuccessfulRuns = runs.Count(r => r.Status == "Completed"),
-            FailedRuns = runs.Count(r => r.Status == "Failed"),
-            Jobs = new EntitySummaryDto
-            {
-                Total = await _dbContext.Jobs.CountAsync(ct),
-                Migrated = await _dbContext.Jobs.CountAsync(j => j.IsMigrated, ct),
-                Pending = await _dbContext.Jobs.CountAsync(j => !j.IsMigrated && string.IsNullOrEmpty(j.MigrationError), ct),
-                Failed = await _dbContext.Jobs.CountAsync(j => !j.IsMigrated && !string.IsNullOrEmpty(j.MigrationError), ct)
-            },
-            Candidates = new EntitySummaryDto
-            {
-                Total = await _dbContext.Candidates.CountAsync(ct),
-                Migrated = await _dbContext.Candidates.CountAsync(c => c.IsMigrated, ct),
-                Pending = await _dbContext.Candidates.CountAsync(c => !c.IsMigrated && string.IsNullOrEmpty(c.MigrationError), ct),
-                Failed = await _dbContext.Candidates.CountAsync(c => !c.IsMigrated && !string.IsNullOrEmpty(c.MigrationError), ct)
-            },
-            Applications = new EntitySummaryDto
-            {
-                Total = await _dbContext.Applications.CountAsync(ct),
-                Migrated = await _dbContext.Applications.CountAsync(a => a.IsMigrated, ct),
-                Pending = await _dbContext.Applications.CountAsync(a => !a.IsMigrated && string.IsNullOrEmpty(a.MigrationError), ct),
-                Failed = await _dbContext.Applications.CountAsync(a => !a.IsMigrated && !string.IsNullOrEmpty(a.MigrationError), ct)
-            },
-            CvUploads = new EntitySummaryDto { Total = cvTotal, Migrated = cvMigrated, Pending = cvPending, Failed = cvTotal - cvMigrated - cvPending },
-            Comments = new EntitySummaryDto { Total = commentTotal, Migrated = commentMigrated, Pending = commentTotal - commentMigrated, Failed = 0 },
-            Summaries = new EntitySummaryDto { Total = summaryTotal, Migrated = summaryMigrated, Pending = summaryTotal - summaryMigrated, Failed = 0 },
-            History = new EntitySummaryDto { Total = historyTotal, Migrated = historyMigrated, Pending = historyTotal - historyMigrated, Failed = 0 },
-            LastMigrationDate = lastRun?.StartedAt
-        };
-    }
-
-    public async Task CancelMigrationAsync(int runId, CancellationToken ct = default)
-    {
-        _currentMigrationCts?.Cancel();
-
-        var run = await _dbContext.MigrationRuns.FindAsync(new object[] { runId }, ct);
-        if (run != null && run.Status == "Running")
-        {
-            run.Status = "Cancelled";
-            run.CompletedAt = DateTime.UtcNow;
-            await _dbContext.SaveChangesAsync(ct);
+            await _db.SaveChangesAsync(ct);
+            cursor = batch.Max(h => h.Id);
+            _log.LogInformation("  History: {Ok} synced, {Fail} failed (cursor={C})", ok, fail, cursor);
+            await Task.Delay(_cfg.DelayBetweenBatchesMs, ct);
         }
     }
 
-    public async Task<MigrationResultDto> RetryFailedMigrationsAsync(RetryMigrationDto options, CancellationToken ct = default)
-    {
-        var entityType = options.EntityType?.ToLowerInvariant() ?? "all";
+    // ================================================================
+    //  HELPERS
+    // ================================================================
 
-        var migrationOptions = new MigrationOptionsDto
+    private void WriteLog(string type, int id, int odooId, EntityMigrationResult r)
+    {
+        _db.MigrationLogs.Add(new MigrationLog
         {
-            MigrateJobs = entityType is "all" or "job",
-            MigrateCandidates = entityType is "all" or "candidate",
-            MigrateApplications = entityType is "all" or "application",
-            MigrateCvs = entityType is "all" or "cv",
-            MigrateComments = entityType is "all" or "comment",
-            MigrateSummaries = entityType is "all" or "summary",
-            MigrateHistory = entityType is "all" or "history",
-            RetryFailed = true,
-            BatchSize = options.BatchSize > 0 ? options.BatchSize : _settings.DefaultBatchSize
-        };
-
-        return await StartMigrationAsync(migrationOptions, ct);
-    }
-
-    public async Task<int> ResetFailedRecordsAsync(string entityType, CancellationToken ct = default)
-    {
-        int count = 0;
-
-        switch (entityType.ToLowerInvariant())
-        {
-            case "jobs":
-                var failedJobs = await _dbContext.Jobs.Where(j => !j.IsMigrated && !string.IsNullOrEmpty(j.MigrationError)).ToListAsync(ct);
-                foreach (var j in failedJobs) { j.MigrationError = null; }
-                count = failedJobs.Count;
-                break;
-
-            case "candidates":
-                var failedCandidates = await _dbContext.Candidates.Where(c => !c.IsMigrated && !string.IsNullOrEmpty(c.MigrationError)).ToListAsync(ct);
-                foreach (var c in failedCandidates) { c.MigrationError = null; }
-                count = failedCandidates.Count;
-                break;
-
-            case "applications":
-                var failedApps = await _dbContext.Applications.Where(a => !a.IsMigrated && !string.IsNullOrEmpty(a.MigrationError)).ToListAsync(ct);
-                foreach (var a in failedApps) { a.MigrationError = null; }
-                count = failedApps.Count;
-                break;
-
-            default:
-                return 0;
-        }
-
-        await _dbContext.SaveChangesAsync(ct);
-        _logger.LogInformation("Reset {Count} failed {EntityType} records for retry", count, entityType);
-        return count;
-    }
-
-    public async Task<List<MigrationStatusDto>> GetAllRunsAsync(CancellationToken ct = default)
-    {
-        var runs = await _dbContext.MigrationRuns
-            .OrderByDescending(r => r.StartedAt)
-            .Take(50)
-            .ToListAsync(ct);
-
-        return runs.Select(MapRunToStatus).ToList();
-    }
-
-    // ========================================================================
-    // HELPERS
-    // ========================================================================
-
-    private async Task<int> CountPendingAsync<T>(bool retryFailed, CancellationToken ct) where T : class
-    {
-        if (typeof(T) == typeof(Job))
-        {
-            return retryFailed
-                ? await _dbContext.Jobs.CountAsync(j => !j.IsMigrated, ct)
-                : await _dbContext.Jobs.CountAsync(j => !j.IsMigrated && string.IsNullOrEmpty(j.MigrationError), ct);
-        }
-        return 0;
-    }
-
-    private async Task<int> CountPendingCandidatesAsync(bool retryFailed, CancellationToken ct)
-    {
-        return retryFailed
-            ? await _dbContext.Candidates.CountAsync(c => !c.IsMigrated && !string.IsNullOrEmpty(c.Email), ct)
-            : await _dbContext.Candidates.CountAsync(c => !c.IsMigrated && !string.IsNullOrEmpty(c.Email) && string.IsNullOrEmpty(c.MigrationError), ct);
-    }
-
-    private async Task<int> CountPendingApplicationsAsync(bool retryFailed, CancellationToken ct)
-    {
-        var query = _dbContext.Applications
-            .Include(a => a.Candidate)
-            .Include(a => a.Job)
-            .Where(a => !a.IsMigrated
-                && a.Candidate.IsMigrated
-                && !string.IsNullOrEmpty(a.Candidate.ZohoCandidateId)
-                && a.Job.IsMigrated
-                && !string.IsNullOrEmpty(a.Job.ZohoJobId));
-
-        if (!retryFailed)
-            query = query.Where(a => string.IsNullOrEmpty(a.MigrationError));
-
-        return await query.CountAsync(ct);
-    }
-
-    private static string BuildApplicationComments(Application app)
-    {
-        var comments = $"Applied on {app.AppliedAt?.ToString("yyyy-MM-dd") ?? app.CreatedAt.ToString("yyyy-MM-dd")}. " +
-                      $"Status: {app.Status}. Priority: {app.Priority}";
-
-        if (!string.IsNullOrEmpty(app.CoverNote))
-            comments += $"\n\nCover Note: {app.CoverNote}";
-
-        return comments;
-    }
-
-    private void WriteMigrationLog(string entityType, int entityId, int odooId, EntityMigrationResult result)
-    {
-        _dbContext.MigrationLogs.Add(new MigrationLog
-        {
-            EntityType = entityType,
-            EntityId = entityId,
-            OdooId = odooId,
-            ZohoId = result.ZohoId,
-            Status = result.Success ? "Success" : "Failed",
-            ErrorMessage = result.ErrorMessage,
-            ErrorDetails = result.ErrorDetails,
-            StartedAt = DateTime.UtcNow,
-            CompletedAt = DateTime.UtcNow
+            EntityType = type, EntityId = id, OdooId = odooId,
+            ZohoId = r.ZohoId,
+            Status = r.Success ? "Success" : "Failed",
+            ErrorMessage = r.ErrorMessage, ErrorDetails = r.ErrorDetails,
+            StartedAt = DateTime.UtcNow, CompletedAt = DateTime.UtcNow
         });
-
-        if (result.Success)
-            _logger.LogDebug("{EntityType} {Id} (Odoo:{OdooId}) -> Zoho:{ZohoId}", entityType, entityId, odooId, result.ZohoId);
-        else
-            _logger.LogWarning("{EntityType} {Id} (Odoo:{OdooId}) FAILED: {Error}", entityType, entityId, odooId, result.ErrorMessage);
     }
+
+    private void LogFinalSummary(MigrationRun run)
+    {
+        _log.LogInformation(
+            "╔══════════════════════════════════════════════════╗");
+        _log.LogInformation(
+            "║  Run {Id} {Status} in {Dur}                     ║",
+            run.Id, run.Status,
+            run.CompletedAt.HasValue
+                ? (run.CompletedAt.Value - run.StartedAt).ToString(@"hh\:mm\:ss")
+                : "?");
+        _log.LogInformation(
+            "║  Jobs     {M}/{T}  (failed {F})                 ║",
+            run.MigratedJobs, run.TotalJobs, run.FailedJobs);
+        _log.LogInformation(
+            "║  Cands    {M}/{T}  (failed {F})                 ║",
+            run.MigratedCandidates, run.TotalCandidates, run.FailedCandidates);
+        _log.LogInformation(
+            "║  Apps     {M}/{T}  (failed {F})                 ║",
+            run.MigratedApplications, run.TotalApplications, run.FailedApplications);
+        _log.LogInformation(
+            "║  CVs      {U}  (failed {F})                     ║",
+            run.TotalCvsUploaded, run.FailedCvUploads);
+        _log.LogInformation(
+            "╚══════════════════════════════════════════════════╝");
+    }
+
+    private async Task<int> PendingJobs(bool retry, CancellationToken ct) =>
+        await _db.Jobs.CountAsync(j => !j.IsMigrated && (retry || string.IsNullOrEmpty(j.MigrationError)), ct);
+
+    private async Task<int> PendingCandidates(bool retry, CancellationToken ct) =>
+        await _db.Candidates.CountAsync(c => !c.IsMigrated && !string.IsNullOrEmpty(c.Email)
+            && (retry || string.IsNullOrEmpty(c.MigrationError)), ct);
+
+    private async Task<int> PendingApplications(bool retry, CancellationToken ct) =>
+        await _db.Applications
+            .Include(a => a.Candidate).Include(a => a.Job)
+            .CountAsync(a => !a.IsMigrated
+                && a.Candidate.IsMigrated && !string.IsNullOrEmpty(a.Candidate.ZohoCandidateId)
+                && a.Job.IsMigrated && !string.IsNullOrEmpty(a.Job.ZohoJobId)
+                && (retry || string.IsNullOrEmpty(a.MigrationError)), ct);
 
     private static string? GetFileNameFromUrl(string url)
     {
         try { return Path.GetFileName(new Uri(url).AbsolutePath); }
         catch { return null; }
     }
-
-    private static IQueryable<T> ApplySyncFilter<T>(
-        IQueryable<T> query, string? filter,
-        System.Linq.Expressions.Expression<Func<T, bool>> isMigratedExpr,
-        System.Linq.Expressions.Expression<Func<T, string?>> errorExpr) where T : class
-    {
-        // For simple filters we build manual conditions
-        return filter?.ToLowerInvariant() switch
-        {
-            "synced" => query.Where(isMigratedExpr),
-            "pending" => query.Where(NegateExpression(isMigratedExpr)),
-            "failed" => query.Where(NegateExpression(isMigratedExpr)),
-            _ => query
-        };
-    }
-
-    private static System.Linq.Expressions.Expression<Func<T, bool>> NegateExpression<T>(
-        System.Linq.Expressions.Expression<Func<T, bool>> expression)
-    {
-        var negated = System.Linq.Expressions.Expression.Not(expression.Body);
-        return System.Linq.Expressions.Expression.Lambda<Func<T, bool>>(negated, expression.Parameters);
-    }
-
-    private static MigrationStatusDto MapRunToStatus(MigrationRun run) => new()
-    {
-        RunId = run.Id,
-        Status = run.Status,
-        StartedAt = run.StartedAt,
-        CompletedAt = run.CompletedAt,
-        Jobs = new MigrationProgressDto { Total = run.TotalJobs, Migrated = run.MigratedJobs, Failed = run.FailedJobs },
-        Candidates = new MigrationProgressDto { Total = run.TotalCandidates, Migrated = run.MigratedCandidates, Failed = run.FailedCandidates },
-        Applications = new MigrationProgressDto { Total = run.TotalApplications, Migrated = run.MigratedApplications, Failed = run.FailedApplications },
-        CvUploads = new MigrationProgressDto { Total = run.TotalCvsUploaded + run.FailedCvUploads, Migrated = run.TotalCvsUploaded, Failed = run.FailedCvUploads }
-    };
 }

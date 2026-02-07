@@ -6,89 +6,41 @@ using OdooToZohoMigration.Infrastructure.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ====================================================================
-// DATABASE
-// ====================================================================
-builder.Services.AddDbContext<MigrationDbContext>(options =>
-    options.UseSqlServer(
+// ── Database ─────────────────────────────────────────────────────────
+builder.Services.AddDbContext<MigrationDbContext>(opt =>
+    opt.UseSqlServer(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-        sqlOptions =>
-        {
-            sqlOptions.CommandTimeout(300); // 5 min for long-running queries
-            sqlOptions.EnableRetryOnFailure(3);
-        }));
+        sql => { sql.CommandTimeout(300); sql.EnableRetryOnFailure(3); }));
 
-// ====================================================================
-// CONFIGURATION
-// ====================================================================
+// ── Config sections ──────────────────────────────────────────────────
 builder.Services.Configure<MigrationSettings>(
     builder.Configuration.GetSection("MigrationSettings"));
-
 builder.Services.Configure<ZohoRecruitSettings>(
     builder.Configuration.GetSection("ZohoRecruit"));
 
-// ====================================================================
-// SERVICES
-// ====================================================================
+// ── Services ─────────────────────────────────────────────────────────
+builder.Services.AddHttpClient<IZohoRecruitService, ZohoRecruitService>(c =>
+    c.Timeout = TimeSpan.FromMinutes(5));
 
-// Zoho Recruit HTTP client
-builder.Services.AddHttpClient<IZohoRecruitService, ZohoRecruitService>(client =>
-{
-    client.Timeout = TimeSpan.FromMinutes(5);
-});
-
-// Migration service
 builder.Services.AddScoped<IMigrationService, MigrationService>();
-
-// Blob storage service - register your implementation here
-// For now, a placeholder that throws NotImplementedException
 builder.Services.AddScoped<IBlobStorageService, PlaceholderBlobStorageService>();
-
-// Memory cache for Zoho tokens
 builder.Services.AddMemoryCache();
 
-// ====================================================================
-// API
-// ====================================================================
-builder.Services.AddControllers();
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-// Allow long-running requests
-builder.WebHost.ConfigureKestrel(options =>
-{
-    options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(30);
-    options.Limits.RequestHeadersTimeout = TimeSpan.FromMinutes(30);
-});
+// ── Background worker (the only thing that matters) ──────────────────
+builder.Services.AddHostedService<MigrationBackgroundService>();
 
 var app = builder.Build();
-
-// ====================================================================
-// MIDDLEWARE
-// ====================================================================
-app.UseSwagger();
-app.UseSwaggerUI(c =>
-{
-    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Odoo to Zoho Migration API v1");
-    c.RoutePrefix = string.Empty; // Swagger at root
-});
-
-app.UseHttpsRedirection();
-app.UseAuthorization();
-app.MapControllers();
-
 app.Run();
 
-// ====================================================================
-// PLACEHOLDER: Replace with your actual blob storage implementation
-// ====================================================================
+// =====================================================================
+//  Placeholder blob service – replace with your Azure / S3 / local impl
+// =====================================================================
 public class PlaceholderBlobStorageService : IBlobStorageService
 {
     public Task<(Stream? Stream, string? ContentType, string? FileName)> GetCvWithMetadataAsync(
         string blobUrl, CancellationToken ct = default)
     {
-        // TODO: Replace with your Azure Blob Storage or S3 implementation
-        // This placeholder returns null (CV not found) so migration won't crash
+        // TODO: wire up your real blob storage here
         return Task.FromResult<(Stream?, string?, string?)>((null, null, null));
     }
 }
