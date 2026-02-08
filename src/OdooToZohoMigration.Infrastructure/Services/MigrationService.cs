@@ -386,7 +386,7 @@ public class MigrationService : IMigrationService
     }
 
     // ================================================================
-    //  PHASE 4 — APPLICATIONS  (1-by-1 with configurable delay)
+    //  PHASE 4 — APPLICATIONS  (associate + set hiring pipeline stage)
     // ================================================================
 
     private async Task MigrateApplicationsAsync(MigrationRun run, CancellationToken ct)
@@ -396,7 +396,9 @@ public class MigrationService : IMigrationService
         while (true)
         {
             var batch = await _db.Applications
-                .Include(a => a.Candidate).Include(a => a.Job)
+                .Include(a => a.Candidate)
+                .Include(a => a.Job)
+                .Include(a => a.Stage)   // load Stage for pipeline mapping
                 .Where(a => !a.IsMigrated && a.Id > cursor
                     && a.Candidate.IsMigrated && !string.IsNullOrEmpty(a.Candidate.ZohoCandidateId)
                     && a.Job.IsMigrated && !string.IsNullOrEmpty(a.Job.ZohoJobId)
@@ -409,21 +411,52 @@ public class MigrationService : IMigrationService
 
             foreach (var a in batch)
             {
+                // 1. Build comment
                 var note = $"Applied {a.AppliedAt?.ToString("yyyy-MM-dd") ?? a.CreatedAt.ToString("yyyy-MM-dd")}. " +
                            $"Status: {a.Status}. Priority: {a.Priority}";
                 if (!string.IsNullOrEmpty(a.CoverNote))
                     note += $"\n\nCover Note: {a.CoverNote}";
 
+                // 2. Associate candidate with job
                 var r = await _zoho.AssociateCandidateWithJobAsync(
                     a.Candidate.ZohoCandidateId!, a.Job.ZohoJobId!, note, ct);
 
-                a.IsMigrated = r.Success; a.ZohoApplicationId = r.ZohoId;
+                a.IsMigrated = r.Success;
+                a.ZohoApplicationId = r.ZohoId;
                 a.MigratedAt = r.Success ? DateTime.UtcNow : null;
                 a.MigrationError = r.ErrorMessage;
                 WriteLog("Application", a.Id, a.OdooId, r);
-                if (r.Success) ok++; else fail++;
 
-                // configurable delay between each call
+                // 3. If associate succeeded → set hiring pipeline stage
+                if (r.Success && !string.IsNullOrEmpty(r.ZohoId))
+                {
+                    var zohoStage = MapOdooStageToZohoPipeline(a.Stage?.Name);
+                    try
+                    {
+                        await Task.Delay(_cfg.ApplicationsDelayMs, ct); // throttle before status call
+                        var stageResult = await _zoho.UpdateApplicationStatusAsync(r.ZohoId, zohoStage, ct);
+
+                        if (stageResult.Success)
+                            _log.LogInformation("  App {Id}: associated + stage set to '{Stage}'",
+                                a.Id, zohoStage);
+                        else
+                            _log.LogWarning("  App {Id}: associated OK but stage update failed: {Err}",
+                                a.Id, stageResult.ErrorMessage);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "  App {Id}: associated OK but stage update threw: {Msg}",
+                            a.Id, ex.Message);
+                    }
+
+                    ok++;
+                }
+                else
+                {
+                    fail++;
+                }
+
+                // throttle between each application
                 await Task.Delay(_cfg.ApplicationsDelayMs, ct);
             }
 
@@ -433,6 +466,68 @@ public class MigrationService : IMigrationService
             _log.LogInformation("  Applications: {Ok}/{Total} synced, {Fail} failed (cursor={C})",
                 ok, run.TotalApplications, fail, cursor);
         }
+    }
+
+    /// <summary>
+    /// Maps Odoo Stages.Name → Zoho Recruit Hiring Pipeline stage.
+    /// If stage is null or not recognized → defaults to "KIV".
+    /// </summary>
+    private static string MapOdooStageToZohoPipeline(string? stageName)
+    {
+        if (string.IsNullOrWhiteSpace(stageName))
+            return "KIV";  // default when no stage assigned
+
+        // Normalize for matching
+        var normalized = stageName.Trim();
+
+        // Exact match against the Zoho hiring pipeline stages
+        var zohoStages = new[]
+        {
+            "Unassigned",
+            "Initial Screening",
+            "Hacker Rank",
+            "Hacker Rank Reject",
+            "First Interview",
+            "Final Interview",
+            "Technical Reject",
+            "HR Reject",
+            "On Hold",
+            "KIV",
+            "Selected",
+            "Contract Proposal",
+            "Offer Signed",
+            "Offer Decline",
+            "Joined"
+        };
+
+        // Try exact match (case-insensitive)
+        var match = zohoStages.FirstOrDefault(s =>
+            string.Equals(s, normalized, StringComparison.OrdinalIgnoreCase));
+
+        if (match != null)
+            return match;
+
+        // Fuzzy mapping for common Odoo variations
+        return normalized.ToLowerInvariant() switch
+        {
+            "initial qualification" or "screening" => "Initial Screening",
+            "first interview" or "interview 1" or "1st interview" => "First Interview",
+            "second interview" or "final interview" or "interview 2" or "2nd interview" => "Final Interview",
+            "technical reject" or "tech reject" or "technical rejection" => "Technical Reject",
+            "hr reject" or "hr rejection" => "HR Reject",
+            "hacker rank" or "hackerrank" or "coding test" => "Hacker Rank",
+            "hacker rank reject" or "hackerrank reject" => "Hacker Rank Reject",
+            "on hold" or "on-hold" or "onhold" or "hold" => "On Hold",
+            "kiv" or "keep in view" => "KIV",
+            "selected" or "hired" => "Selected",
+            "contract proposal" or "contract" or "offer" => "Contract Proposal",
+            "offer signed" or "contract signed" or "accepted" => "Offer Signed",
+            "offer decline" or "offer declined" or "declined" or "refused" => "Offer Decline",
+            "joined" or "onboarded" or "onboarding" => "Joined",
+            "new" or "applied" or "unassigned" => "Unassigned",
+            "rejected" or "refuse" or "rejection" => "HR Reject",
+            _ => "KIV"  // anything unrecognized → KIV
+        };
     }
 
     // ================================================================

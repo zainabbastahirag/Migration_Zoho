@@ -61,6 +61,12 @@ public class MigrationDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(e => e.JobId)
                 .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(e => e.Stage)
+                .WithMany()
+                .HasForeignKey(e => e.StageId)
+                .IsRequired(false)
+                .OnDelete(DeleteBehavior.SetNull);
         });
 
         modelBuilder.Entity<ApplicationComment>(entity =>

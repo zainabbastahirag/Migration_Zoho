@@ -39,6 +39,7 @@ public class Application
     // Navigation properties
     public Job Job { get; set; } = null!;
     public Candidate Candidate { get; set; } = null!;
+    public Stage? Stage { get; set; }
     public ICollection<ApplicationComment> Comments { get; set; } = new List<ApplicationComment>();
     public ICollection<ApplicationHistory> Histories { get; set; } = new List<ApplicationHistory>();
 }

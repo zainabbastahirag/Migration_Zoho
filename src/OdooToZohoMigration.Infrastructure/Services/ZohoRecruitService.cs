@@ -507,16 +507,14 @@ public class ZohoRecruitService : IZohoRecruitService
         }
     }
 
-    private static string MapApplicationStatus(string? status) => status?.ToLower() switch
-    {
-        "new" or "initial qualification" => "New",
-        "screening" or "first interview" => "Screening",
-        "interview" or "second interview" => "Interview",
-        "offer" or "contract proposal" => "Offer",
-        "hired" or "contract signed" => "Hired",
-        "rejected" or "refused" => "Rejected",
-        _ => status ?? "New"
-    };
+    /// <summary>
+    /// Passes the status string through directly to Zoho.
+    /// The MigrationService.MapOdooStageToZohoPipeline() already maps
+    /// Odoo stage names to exact Zoho hiring pipeline stage names, so
+    /// this method just forwards the value as-is.
+    /// </summary>
+    private static string MapApplicationStatus(string? status) =>
+        status ?? "KIV";
 
     #endregion
 
