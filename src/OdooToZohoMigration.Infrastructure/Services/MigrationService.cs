@@ -81,6 +81,20 @@ public class MigrationService : IMigrationService
 
         try
         {
+            // Phase 0 ─ Unlock locked job openings by distributing across recruiters
+            if (_cfg.UnlockJobOpenings && _cfg.RecruiterEmails.Count > 0)
+            {
+                var lockedCount = await _db.Jobs.CountAsync(j =>
+                    j.IsMigrated && !string.IsNullOrEmpty(j.ZohoJobId), ct);
+                if (lockedCount > 0)
+                {
+                    _log.LogInformation(
+                        "▶ Phase 0: Unlock Job Openings — distributing {Count} jobs across {R} recruiters",
+                        lockedCount, _cfg.RecruiterEmails.Count);
+                    await UnlockJobOpeningsAsync(ct);
+                }
+            }
+
             if (_cfg.MigrateJobs && run.TotalJobs > 0)
             {
                 _log.LogInformation("▶ Phase 1/7: Jobs ({Count} pending, batch={B}, delay={D}ms)",
@@ -172,6 +186,67 @@ public class MigrationService : IMigrationService
         run.CompletedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync(CancellationToken.None);
         LogFinalSummary(run);
+    }
+
+    // ================================================================
+    //  PHASE 0 — UNLOCK JOB OPENINGS (distribute across recruiters)
+    // ================================================================
+
+    private async Task UnlockJobOpeningsAsync(CancellationToken ct)
+    {
+        var recruiters = _cfg.RecruiterEmails;
+        if (recruiters.Count == 0)
+        {
+            _log.LogWarning("  No recruiter emails configured. Skipping unlock.");
+            return;
+        }
+
+        int ok = 0, fail = 0, cursor = 0, recruiterIndex = 0;
+
+        while (true)
+        {
+            // Get migrated jobs that have a ZohoJobId
+            var batch = await _db.Jobs
+                .Where(j => j.IsMigrated
+                    && !string.IsNullOrEmpty(j.ZohoJobId)
+                    && j.Id > cursor)
+                .OrderBy(j => j.Id)
+                .Take(_cfg.UnlockJobsBatchSize)
+                .ToListAsync(ct);
+
+            if (batch.Count == 0) break;
+
+            foreach (var job in batch)
+            {
+                // Round-robin across recruiters
+                var recruiterEmail = recruiters[recruiterIndex % recruiters.Count];
+                recruiterIndex++;
+
+                var result = await _zoho.UpdateJobOpeningRecruiterAsync(
+                    job.ZohoJobId!, recruiterEmail, ct);
+
+                if (result.Success)
+                {
+                    ok++;
+                    _log.LogDebug("  Job {ZohoId} → recruiter {Email}", job.ZohoJobId, recruiterEmail);
+                }
+                else
+                {
+                    fail++;
+                    _log.LogWarning("  Job {ZohoId} recruiter update FAILED: {Err}",
+                        job.ZohoJobId, result.ErrorMessage);
+                }
+
+                await Task.Delay(_cfg.UnlockJobsDelayMs, ct);
+            }
+
+            cursor = batch.Max(j => j.Id);
+            _log.LogInformation("  Unlock Jobs: {Ok} updated, {Fail} failed (cursor={C})",
+                ok, fail, cursor);
+        }
+
+        _log.LogInformation("  Unlock Jobs complete: {Ok} reassigned across {R} recruiters, {Fail} failed",
+            ok, recruiters.Count, fail);
     }
 
     // ================================================================

@@ -60,6 +60,24 @@ public class MigrationSettings
     /// <summary>Parallel CV upload threads (1 = sequential).</summary>
     public int MaxConcurrentCvUploads { get; set; } = 3;
 
+    // ── Unlock Job Openings ─────────────────────────────────────────
+    /// <summary>
+    /// Enable Phase 0: reassign migrated job openings across multiple
+    /// Zoho recruiters so they don't exceed per-recruiter limits.
+    /// Runs BEFORE Phase 1 (new jobs).
+    /// </summary>
+    public bool UnlockJobOpenings { get; set; } = false;
+
+    /// <summary>
+    /// List of Zoho Recruit recruiter email addresses.
+    /// Jobs are distributed round-robin across these recruiters.
+    /// Example: ["recruiter1@company.com","recruiter2@company.com"]
+    /// </summary>
+    public List<string> RecruiterEmails { get; set; } = new();
+
+    public int UnlockJobsBatchSize { get; set; } = 25;
+    public int UnlockJobsDelayMs { get; set; } = 2000;
+
     // ── Repeat ────────────────────────────────────────────────────────
     /// <summary>Seconds between periodic runs (0 = run once then stop).</summary>
     public int RepeatIntervalSeconds { get; set; } = 0;

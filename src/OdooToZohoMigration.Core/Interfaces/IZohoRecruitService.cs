@@ -14,6 +14,7 @@ public interface IZohoRecruitService
     Task<EntityMigrationResult> CreateJobOpeningAsync(Job job, CancellationToken ct = default);
     Task<EntityMigrationResult> UpdateJobOpeningAsync(string zohoId, Job job, CancellationToken ct = default);
     Task<List<EntityMigrationResult>> CreateJobOpeningsBatchAsync(IEnumerable<Job> jobs, CancellationToken ct = default);
+    Task<EntityMigrationResult> UpdateJobOpeningRecruiterAsync(string zohoJobId, string recruiterEmail, CancellationToken ct = default);
 
     // Candidates
     Task<EntityMigrationResult> CreateCandidateAsync(Candidate candidate, CancellationToken ct = default);

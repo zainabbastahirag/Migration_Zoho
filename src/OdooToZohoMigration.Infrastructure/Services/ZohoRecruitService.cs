@@ -190,6 +190,45 @@ public class ZohoRecruitService : IZohoRecruitService
         return results;
     }
 
+    /// <summary>
+    /// Update the Account_Manager (recruiter) on an existing job opening.
+    /// This unlocks job openings that are locked due to per-recruiter limits.
+    /// </summary>
+    public async Task<EntityMigrationResult> UpdateJobOpeningRecruiterAsync(
+        string zohoJobId, string recruiterEmail, CancellationToken ct = default)
+    {
+        try
+        {
+            // Zoho Recruit v2 API: Account_Manager accepts email string
+            var request = new
+            {
+                data = new[]
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["Account_Manager"] = new { email = recruiterEmail }
+                    }
+                }
+            };
+
+            var response = await SendZohoRequestAsync<ZohoApiResponse<ZohoRecordResponse>>(
+                HttpMethod.Put, $"/recruit/v2/Job_Openings/{zohoJobId}", request, ct);
+
+            var record = response?.Data?.FirstOrDefault();
+            return new EntityMigrationResult
+            {
+                Success = record?.Status == "success" || record?.Code == "SUCCESS",
+                ZohoId = zohoJobId,
+                ErrorMessage = record?.Status != "success" ? record?.Message : null
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error updating recruiter on job {ZohoJobId} to {Email}", zohoJobId, recruiterEmail);
+            return new EntityMigrationResult { Success = false, ErrorMessage = ex.Message, ErrorDetails = ex.ToString() };
+        }
+    }
+
     private static ZohoJobOpeningData MapJobToZohoData(Job job) => new()
     {
         Job_Opening_Name = job.Title,
