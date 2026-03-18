@@ -15,4 +15,15 @@ public class SpotReport
     public bool IsDeleted { get; set; } = false;
     public string DeletedBy { get; set; } = "";
     public DateTime? DeletedDate { get; set; }
+
+    /// <summary>
+    /// The final generated Markdown report content, stored directly in SQL.
+    /// No blob storage needed for report files.
+    /// </summary>
+    public string? ReportMarkdown { get; set; }
+
+    /// <summary>
+    /// The final V12 JSON report structure, stored directly in SQL.
+    /// </summary>
+    public string? ReportJsonContent { get; set; }
 }

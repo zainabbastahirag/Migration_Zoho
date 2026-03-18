@@ -398,16 +398,19 @@ public class SpotDataService : ISpotDataService
     }
 
     /// <summary>
-    /// Full report generation pipeline (converted from Python generate_spot_report_task):
-    ///   1. Validate company documents
-    ///   2. Extract layout from each file via Azure Doc Int → save clean JSON to blob
-    ///   3. Combine all clean JSONs into one combined file
-    ///   4. Generate report sections (A, B, C, D) via OpenAI prompts from DB
-    ///   5. Combine sections into final report, upload to blob
-    ///   6. Update report record with URLs
+    /// SPOT Report Generation — 6 clean steps.
+    ///
+    /// STORAGE RULE:
+    ///   - Uploaded PDFs → Azure Blob (already there from /classify)
+    ///   - Extracted text → SQL (DocumentMetadata.ExtractedText)
+    ///   - Final report MD + JSON → SQL (Reports.ReportMarkdown + ReportJsonContent)
+    ///   - NO blob storage for intermediate or output files
     /// </summary>
     public async Task<SpotResult> ReportWorkerAsync(string jobId, CancellationToken ct = default)
     {
+        // ────────────────────────────────────────────────────────────
+        // STEP 0: Find the job
+        // ────────────────────────────────────────────────────────────
         var job = await _db.SpotJobs.FirstOrDefaultAsync(j =>
             j.JobId.ToString() == jobId && j.JobType == (int)JobType.Report
             && (j.Status == nameof(JobState.PendingQueue) || j.Status == nameof(JobState.Processing)), ct);
@@ -420,9 +423,11 @@ public class SpotDataService : ISpotDataService
 
         try
         {
-            await LogStep(jobId, "Initializing report generation...", ct);
+            // ────────────────────────────────────────────────────────
+            // STEP 1: Load all company files from SQL
+            // ────────────────────────────────────────────────────────
+            await LogStep(jobId, "Step 1/6: Loading company files...", ct);
 
-            // ── Step 1: Get company files ────────────────────────────
             var files = await _db.SpotDocuments
                 .Where(d => d.CompanyId == job.CompanyId && !d.IsDeleted)
                 .ToListAsync(ct);
@@ -433,8 +438,13 @@ public class SpotDataService : ISpotDataService
                 return Fail(400, "No company files found.");
             }
 
-            // ── Step 2: Validate company documents ───────────────────
-            await LogStep(jobId, "Validating company documents...", ct);
+            _log.LogInformation("[REPORT] Step 1: Found {Count} files for {Company}", files.Count, job.CompanyId);
+
+            // ────────────────────────────────────────────────────────
+            // STEP 2: Validate company documents (SSM cross-check)
+            // ────────────────────────────────────────────────────────
+            await LogStep(jobId, "Step 2/6: Validating documents...", ct);
+
             var validation = await ValidateCompanyDocumentsAsync(job.CompanyId, ct);
             if (validation.StatusCode != 200)
             {
@@ -442,14 +452,32 @@ public class SpotDataService : ISpotDataService
                 return Fail(400, validation.Message);
             }
 
-            // ── Step 3: Extract layout for each file ─────────────────
-            await LogStep(jobId, "Extracting document layouts...", ct);
+            // ────────────────────────────────────────────────────────
+            // STEP 3: Extract text from each PDF (Azure Doc Intelligence)
+            //         Save extracted text directly to SQL — no blob needed
+            // ────────────────────────────────────────────────────────
+            await LogStep(jobId, "Step 3/6: Extracting text from PDFs...", ct);
+
             var container = _blob.GetBlobContainerClient(_cfg.BlobContainer);
-            int processed = 0;
-            var allExtractedTexts = new List<(string FileName, string DocType, string Text)>();
+            var extractedDocs = new List<ExtractedDocument>();
 
             foreach (var file in files)
             {
+                // If we already extracted text before, reuse it (no need to call Azure again)
+                if (!string.IsNullOrEmpty(file.ExtractedText))
+                {
+                    extractedDocs.Add(new ExtractedDocument
+                    {
+                        FileName = file.FileName,
+                        DocType = file.DocumentType ?? "Unknown",
+                        Text = file.ExtractedText,
+                        PageCount = file.ExtractedPageCount ?? 0
+                    });
+                    _log.LogDebug("  {File}: using cached extracted text from SQL", file.FileName);
+                    continue;
+                }
+
+                // Download PDF from blob and extract text via Azure Doc Intelligence
                 if (string.IsNullOrEmpty(file.FilePath)) continue;
                 try
                 {
@@ -457,112 +485,100 @@ public class SpotDataService : ISpotDataService
                     if (!await blobClient.ExistsAsync(ct)) continue;
 
                     var download = await blobClient.DownloadContentAsync(ct);
-                    var fileBytes = download.Value.Content.ToArray();
+                    var pdfBytes = download.Value.Content.ToArray();
 
-                    var layoutOp = await _docInt.AnalyzeDocumentAsync(
+                    var layoutResult = await _docInt.AnalyzeDocumentAsync(
                         WaitUntil.Completed, "prebuilt-layout",
-                        new MemoryStream(fileBytes), cancellationToken: ct);
+                        new MemoryStream(pdfBytes), cancellationToken: ct);
 
-                    var layoutText = layoutOp.Value.Content ?? "";
+                    var text = layoutResult.Value.Content ?? "";
+                    var pageCount = layoutResult.Value.Pages.Count;
 
-                    // Save clean JSON to blob
-                    var cleanJson = JsonSerializer.Serialize(new
+                    // Save extracted text to SQL (so next run doesn't need to re-extract)
+                    file.ExtractedText = text;
+                    file.ExtractedPageCount = pageCount;
+
+                    extractedDocs.Add(new ExtractedDocument
                     {
-                        fileName = file.FileName,
-                        docType = file.DocumentType,
-                        text = layoutText,
-                        pageCount = layoutOp.Value.Pages.Count
+                        FileName = file.FileName,
+                        DocType = file.DocumentType ?? "Unknown",
+                        Text = text,
+                        PageCount = pageCount
                     });
 
-                    var fileId = Path.GetFileNameWithoutExtension(file.FilePath);
-                    var cleanBlobName = $"clean_json_files/{job.CompanyId}/{fileId}_clean.json";
-                    var cleanBytes = System.Text.Encoding.UTF8.GetBytes(cleanJson);
-                    await container.GetBlobClient(cleanBlobName)
-                        .UploadAsync(new MemoryStream(cleanBytes), true, ct);
-
-                    allExtractedTexts.Add((file.FileName, file.DocumentType ?? "Unknown", layoutText));
-                    processed++;
+                    _log.LogInformation("  {File}: extracted {Pages} pages, {Chars} chars",
+                        file.FileName, pageCount, text.Length);
                 }
                 catch (Exception ex)
                 {
-                    _log.LogWarning(ex, "Skipping file {File}: {Err}", file.FileName, ex.Message);
+                    _log.LogWarning(ex, "  {File}: extraction failed, skipping", file.FileName);
                     await LogStep(jobId, $"Warning: skipping {file.FileName}", ct);
                 }
             }
 
-            if (processed == 0)
+            // Save all extracted text to SQL
+            await _db.SaveChangesAsync(ct);
+
+            if (extractedDocs.Count == 0)
             {
-                await FailReportAsync(jobId, job.CompanyId,
-                    "All files failed to process. Check if files exist in storage.", ct);
-                return Fail(500, "All files failed to process.");
+                await FailReportAsync(jobId, job.CompanyId, "No files could be processed.", ct);
+                return Fail(500, "No files could be processed.");
             }
 
-            // ── Step 4: Combine into single context ──────────────────
-            await LogStep(jobId, "Combining document data...", ct);
-            var combinedContext = string.Join("\n\n---\n\n",
-                allExtractedTexts.Select(t => $"[{t.DocType}] {t.FileName}:\n{t.Text}"));
+            _log.LogInformation("[REPORT] Step 3: Extracted text from {Count}/{Total} files",
+                extractedDocs.Count, files.Count);
 
-            // Save combined JSON to blob
-            var combinedJson = JsonSerializer.Serialize(new
-            {
-                companyId = job.CompanyId,
-                documents = allExtractedTexts.Select(t => new { t.FileName, t.DocType, t.Text })
-            });
-            var combinedBlobName = $"clean_json_files/{job.CompanyId}/combined_llm_ready.json";
-            await container.GetBlobClient(combinedBlobName)
-                .UploadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(combinedJson)), true, ct);
-
-            // ── Step 5: Generate full SPOT report via orchestrator ────
-            await LogStep(jobId, "Generating report content via AI (A1-E3 parallel)...", ct);
-
-            var docs = allExtractedTexts.Select(t => new ExtractedDocument
-            {
-                FileName = t.FileName, DocType = t.DocType, Text = t.Text
-            }).ToList();
+            // ────────────────────────────────────────────────────────
+            // STEP 4: Generate all 16 report sections via OpenAI
+            //         (parallel, 5 concurrent, prompts from DB)
+            // ────────────────────────────────────────────────────────
+            await LogStep(jobId, "Step 4/6: Generating report via AI (16 sections)...", ct);
 
             var orchestrator = new SpotReportOrchestrator(_chat, _log);
-            var spotResult = await orchestrator.GenerateAsync(job.CompanyId, docs, ct);
+            var spotResult = await orchestrator.GenerateAsync(job.CompanyId, extractedDocs, ct);
 
             if (!spotResult.Success)
             {
                 await FailReportAsync(jobId, job.CompanyId,
-                    spotResult.ErrorMessage ?? "Report generation failed.", ct);
-                return Fail(500, spotResult.ErrorMessage ?? "Report generation failed.");
+                    spotResult.ErrorMessage ?? "AI generation failed.", ct);
+                return Fail(500, spotResult.ErrorMessage ?? "AI generation failed.");
             }
 
-            // ── Step 6: Upload report + JSON to blob ─────────────────
-            await LogStep(jobId, "Uploading report to storage...", ct);
+            _log.LogInformation("[REPORT] Step 4: Generated report in {Ms}ms", spotResult.DurationMs);
 
-            var reportBlobName = $"reports/{job.CompanyId}/{jobId}_spot_report.md";
-            var reportBytes = System.Text.Encoding.UTF8.GetBytes(spotResult.ReportMarkdown ?? "");
-            await container.GetBlobClient(reportBlobName)
-                .UploadAsync(new MemoryStream(reportBytes), true, ct);
-            var reportUrl = container.GetBlobClient(reportBlobName).Uri.ToString();
+            // ────────────────────────────────────────────────────────
+            // STEP 5: Save final report to SQL (not blob)
+            // ────────────────────────────────────────────────────────
+            await LogStep(jobId, "Step 5/6: Saving report to database...", ct);
 
-            var jsonReportBlobName = $"reports/{job.CompanyId}/{jobId}_spot_report.json";
-            await container.GetBlobClient(jsonReportBlobName)
-                .UploadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(spotResult.ReportJson ?? "{}")), true, ct);
-            var jsonUrl = container.GetBlobClient(jsonReportBlobName).Uri.ToString();
-
-            // ── Step 7: Update DB ────────────────────────────────────
             var report = await _db.SpotReports.FirstOrDefaultAsync(r => r.JobId == jobId, ct);
             if (report != null)
             {
-                report.FileURL = reportUrl;
-                report.JsonURL = jsonUrl;
+                report.ReportMarkdown = spotResult.ReportMarkdown;
+                report.ReportJsonContent = spotResult.ReportJson;
             }
 
+            // ────────────────────────────────────────────────────────
+            // STEP 6: Mark job as done
+            // ────────────────────────────────────────────────────────
             job.Status = nameof(JobState.Success);
             job.FinishedAt = DateTime.UtcNow;
-            await LogStep(jobId, "success", ct);
+            await LogStep(jobId, "Step 6/6: Complete!", ct);
             await _db.SaveChangesAsync(ct);
 
-            _log.LogInformation("SPOT report generated for {Company}, jobId={JobId}", job.CompanyId, jobId);
-            return Ok("Report generated.", new { fileUrl = MakeSasUrl(reportUrl), jsonUrl = MakeSasUrl(jsonUrl) });
+            _log.LogInformation("[REPORT] Done! Company={Company}, JobId={JobId}, Duration={Ms}ms",
+                job.CompanyId, jobId, spotResult.DurationMs);
+
+            return Ok("Report generated.", new
+            {
+                reportId = report?.ReportId,
+                companyId = job.CompanyId,
+                durationMs = spotResult.DurationMs
+            });
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Report generation failed for job {JobId}", jobId);
+            _log.LogError(ex, "[REPORT] Failed for job {JobId}", jobId);
             await FailReportAsync(jobId, job.CompanyId, ex.Message, ct);
             return Fail(500, $"Report generation failed: {ex.Message}");
         }

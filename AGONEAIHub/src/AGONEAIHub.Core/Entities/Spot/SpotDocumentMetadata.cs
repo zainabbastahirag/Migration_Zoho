@@ -25,4 +25,13 @@ public class SpotDocumentMetadata
     public string FileURL { get; set; } = "";
     public string Tags { get; set; } = "";
     public bool WrongType { get; set; } = false;
+
+    /// <summary>
+    /// Text extracted from the PDF via Azure Document Intelligence prebuilt-layout.
+    /// Stored in SQL so we don't need blob storage for intermediate data.
+    /// </summary>
+    public string? ExtractedText { get; set; }
+
+    /// <summary>Number of pages detected by layout extraction.</summary>
+    public int? ExtractedPageCount { get; set; }
 }
