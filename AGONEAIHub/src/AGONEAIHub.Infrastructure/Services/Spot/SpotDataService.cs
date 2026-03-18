@@ -25,6 +25,7 @@ public class SpotDataService : ISpotDataService
     private readonly SpotSettings _cfg;
     private readonly BlobServiceClient _blob;
     private readonly DocumentAnalysisClient _docInt;
+    private readonly IChatService _chat;
     private readonly INotificationService _notify;
     private readonly ILogger<SpotDataService> _log;
 
@@ -35,11 +36,13 @@ public class SpotDataService : ISpotDataService
         { "Johor","Kedah","Kelantan","Melaka","Negeri Sembilan","Pahang","Perak","Perlis",
           "Pulau Pinang","Sabah","Sarawak","Selangor","Terengganu","Kuala Lumpur","Putrajaya","Labuan" };
 
+    private static readonly string[] ReportSections = { "SectionA", "SectionB", "SectionC", "SectionD" };
+
     public SpotDataService(
         AIHubDbContext db, IOptions<SpotSettings> cfg,
-        INotificationService notify, ILogger<SpotDataService> log)
+        IChatService chat, INotificationService notify, ILogger<SpotDataService> log)
     {
-        _db = db; _cfg = cfg.Value; _notify = notify; _log = log;
+        _db = db; _cfg = cfg.Value; _chat = chat; _notify = notify; _log = log;
         _blob = new BlobServiceClient(_cfg.BlobConnectionString);
         _docInt = new DocumentAnalysisClient(new Uri(_cfg.DocIntEndpoint), new AzureKeyCredential(_cfg.DocIntKey));
     }
@@ -394,13 +397,219 @@ public class SpotDataService : ISpotDataService
         return Ok("Report in progress.", new { status = job.Status, currentStep = stepMsg ?? "Queued", startedAt = job.StartedAt });
     }
 
+    /// <summary>
+    /// Full report generation pipeline (converted from Python generate_spot_report_task):
+    ///   1. Validate company documents
+    ///   2. Extract layout from each file via Azure Doc Int → save clean JSON to blob
+    ///   3. Combine all clean JSONs into one combined file
+    ///   4. Generate report sections (A, B, C, D) via OpenAI prompts from DB
+    ///   5. Combine sections into final report, upload to blob
+    ///   6. Update report record with URLs
+    /// </summary>
     public async Task<SpotResult> ReportWorkerAsync(string jobId, CancellationToken ct = default)
     {
-        var job = await _db.SpotJobs.FirstOrDefaultAsync(j => j.JobId.ToString() == jobId && j.JobType == (int)JobType.Report && j.Status == nameof(JobState.PendingQueue), ct);
+        var job = await _db.SpotJobs.FirstOrDefaultAsync(j =>
+            j.JobId.ToString() == jobId && j.JobType == (int)JobType.Report
+            && (j.Status == nameof(JobState.PendingQueue) || j.Status == nameof(JobState.Processing)), ct);
+
         if (job == null) return Fail(404, "Job not found.");
-        job.Status = nameof(JobState.Processing); job.StartedAt = DateTime.UtcNow;
+
+        job.Status = nameof(JobState.Processing);
+        job.StartedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync(ct);
-        return Ok("Report worker started.", null);
+
+        try
+        {
+            await LogStep(jobId, "Initializing report generation...", ct);
+
+            // ── Step 1: Get company files ────────────────────────────
+            var files = await _db.SpotDocuments
+                .Where(d => d.CompanyId == job.CompanyId && !d.IsDeleted)
+                .ToListAsync(ct);
+
+            if (files.Count == 0)
+            {
+                await FailReportAsync(jobId, job.CompanyId, "No company files found.", ct);
+                return Fail(400, "No company files found.");
+            }
+
+            // ── Step 2: Validate company documents ───────────────────
+            await LogStep(jobId, "Validating company documents...", ct);
+            var validation = await ValidateCompanyDocumentsAsync(job.CompanyId, ct);
+            if (validation.StatusCode != 200)
+            {
+                await FailReportAsync(jobId, job.CompanyId, validation.Message, ct);
+                return Fail(400, validation.Message);
+            }
+
+            // ── Step 3: Extract layout for each file ─────────────────
+            await LogStep(jobId, "Extracting document layouts...", ct);
+            var container = _blob.GetBlobContainerClient(_cfg.BlobContainer);
+            int processed = 0;
+            var allExtractedTexts = new List<(string FileName, string DocType, string Text)>();
+
+            foreach (var file in files)
+            {
+                if (string.IsNullOrEmpty(file.FilePath)) continue;
+                try
+                {
+                    var blobClient = container.GetBlobClient(file.FilePath);
+                    if (!await blobClient.ExistsAsync(ct)) continue;
+
+                    var download = await blobClient.DownloadContentAsync(ct);
+                    var fileBytes = download.Value.Content.ToArray();
+
+                    var layoutOp = await _docInt.AnalyzeDocumentAsync(
+                        WaitUntil.Completed, "prebuilt-layout",
+                        new MemoryStream(fileBytes), cancellationToken: ct);
+
+                    var layoutText = layoutOp.Value.Content ?? "";
+
+                    // Save clean JSON to blob
+                    var cleanJson = JsonSerializer.Serialize(new
+                    {
+                        fileName = file.FileName,
+                        docType = file.DocumentType,
+                        text = layoutText,
+                        pageCount = layoutOp.Value.Pages.Count
+                    });
+
+                    var fileId = Path.GetFileNameWithoutExtension(file.FilePath);
+                    var cleanBlobName = $"clean_json_files/{job.CompanyId}/{fileId}_clean.json";
+                    var cleanBytes = System.Text.Encoding.UTF8.GetBytes(cleanJson);
+                    await container.GetBlobClient(cleanBlobName)
+                        .UploadAsync(new MemoryStream(cleanBytes), true, ct);
+
+                    allExtractedTexts.Add((file.FileName, file.DocumentType ?? "Unknown", layoutText));
+                    processed++;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Skipping file {File}: {Err}", file.FileName, ex.Message);
+                    await LogStep(jobId, $"Warning: skipping {file.FileName}", ct);
+                }
+            }
+
+            if (processed == 0)
+            {
+                await FailReportAsync(jobId, job.CompanyId,
+                    "All files failed to process. Check if files exist in storage.", ct);
+                return Fail(500, "All files failed to process.");
+            }
+
+            // ── Step 4: Combine into single context ──────────────────
+            await LogStep(jobId, "Combining document data...", ct);
+            var combinedContext = string.Join("\n\n---\n\n",
+                allExtractedTexts.Select(t => $"[{t.DocType}] {t.FileName}:\n{t.Text}"));
+
+            // Save combined JSON to blob
+            var combinedJson = JsonSerializer.Serialize(new
+            {
+                companyId = job.CompanyId,
+                documents = allExtractedTexts.Select(t => new { t.FileName, t.DocType, t.Text })
+            });
+            var combinedBlobName = $"clean_json_files/{job.CompanyId}/combined_llm_ready.json";
+            await container.GetBlobClient(combinedBlobName)
+                .UploadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(combinedJson)), true, ct);
+
+            // ── Step 5: Generate report sections via OpenAI ──────────
+            await LogStep(jobId, "Generating report content via AI...", ct);
+            var sectionResults = new Dictionary<string, string>();
+
+            foreach (var section in ReportSections)
+            {
+                var promptKey = section.ToLowerInvariant() switch
+                {
+                    "sectiona" => "generate-section-a",
+                    "sectionb" => "generate-section-b",
+                    "sectionc" => "generate-section-c",
+                    "sectiond" => "generate-section-d",
+                    _ => $"generate-{section.ToLowerInvariant()}"
+                };
+
+                await LogStep(jobId, $"Generating {section}...", ct);
+
+                var chatResult = await _chat.ChatWithTemplateAsync(
+                    Core.Enums.ProjectName.AGONESPot, promptKey,
+                    new Dictionary<string, string>
+                    {
+                        ["reportTitle"] = $"SPOT Report - {job.CompanyId}",
+                        ["auditData"] = combinedContext.Length > 30000
+                            ? combinedContext[..30000] : combinedContext
+                    }, ct);
+
+                sectionResults[section] = chatResult.Success
+                    ? chatResult.Response ?? ""
+                    : $"[ERROR generating {section}: {chatResult.ErrorMessage}]";
+
+                _log.LogInformation("  {Section}: {Status} ({Tokens} tokens)",
+                    section, chatResult.Success ? "OK" : "FAILED", chatResult.TotalTokens);
+            }
+
+            // ── Step 6: Combine into final report ────────────────────
+            await LogStep(jobId, "Assembling final report...", ct);
+            var reportContent = $"# SPOT Report — {job.CompanyId}\n" +
+                $"Generated: {DateTime.UtcNow:yyyy-MM-dd HH:mm} UTC\n\n" +
+                $"## Section A: Executive Summary\n\n{sectionResults.GetValueOrDefault("SectionA", "")}\n\n" +
+                $"## Section B: Findings & Observations\n\n{sectionResults.GetValueOrDefault("SectionB", "")}\n\n" +
+                $"## Section C: Risk Assessment\n\n{sectionResults.GetValueOrDefault("SectionC", "")}\n\n" +
+                $"## Section D: Recommendations & Action Plan\n\n{sectionResults.GetValueOrDefault("SectionD", "")}";
+
+            // Upload report to blob
+            var ext = job.ReportType == "pdf" ? "pdf" : "md";
+            var reportBlobName = $"reports/{job.CompanyId}/{jobId}_spot_report.{ext}";
+            var reportBytes = System.Text.Encoding.UTF8.GetBytes(reportContent);
+            await container.GetBlobClient(reportBlobName)
+                .UploadAsync(new MemoryStream(reportBytes), true, ct);
+
+            var reportUrl = container.GetBlobClient(reportBlobName).Uri.ToString();
+
+            // Upload JSON version too
+            var jsonReportBlobName = $"reports/{job.CompanyId}/{jobId}_spot_report.json";
+            var jsonReport = JsonSerializer.Serialize(new
+            {
+                companyId = job.CompanyId,
+                generatedAt = DateTime.UtcNow,
+                sections = sectionResults
+            });
+            await container.GetBlobClient(jsonReportBlobName)
+                .UploadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(jsonReport)), true, ct);
+            var jsonUrl = container.GetBlobClient(jsonReportBlobName).Uri.ToString();
+
+            // ── Step 7: Update DB ────────────────────────────────────
+            var report = await _db.SpotReports.FirstOrDefaultAsync(r => r.JobId == jobId, ct);
+            if (report != null)
+            {
+                report.FileURL = reportUrl;
+                report.JsonURL = jsonUrl;
+            }
+
+            job.Status = nameof(JobState.Success);
+            job.FinishedAt = DateTime.UtcNow;
+            await LogStep(jobId, "success", ct);
+            await _db.SaveChangesAsync(ct);
+
+            _log.LogInformation("SPOT report generated for {Company}, jobId={JobId}", job.CompanyId, jobId);
+            return Ok("Report generated.", new { fileUrl = MakeSasUrl(reportUrl), jsonUrl = MakeSasUrl(jsonUrl) });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Report generation failed for job {JobId}", jobId);
+            await FailReportAsync(jobId, job.CompanyId, ex.Message, ct);
+            return Fail(500, $"Report generation failed: {ex.Message}");
+        }
+    }
+
+    private async Task LogStep(string jobId, string message, CancellationToken ct)
+    {
+        _db.SpotJobLogs.Add(new SpotJobLog { JobId = jobId, Message = message });
+        await _db.SaveChangesAsync(ct);
+    }
+
+    private async Task FailReportAsync(string jobId, string companyId, string message, CancellationToken ct)
+    {
+        await LogStep(jobId, message, ct);
+        await FailJobAsync(jobId, message, ct);
     }
 
     public async Task<SpotResult> GetSpotStatisticsAsync(CancellationToken ct = default)
