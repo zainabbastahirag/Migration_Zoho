@@ -1,4 +1,5 @@
 using AGONEAIHub.Core.Entities;
+using AGONEAIHub.Core.Entities.Spot;
 using AGONEAIHub.Core.Enums;
 using Microsoft.EntityFrameworkCore;
 
@@ -8,12 +9,21 @@ public class AIHubDbContext : DbContext
 {
     public AIHubDbContext(DbContextOptions<AIHubDbContext> options) : base(options) { }
 
+    // ── AI Hub tables ────────────────────────────────────────────────
     public DbSet<PromptTemplate> PromptTemplates { get; set; } = null!;
     public DbSet<PromptExecutionLog> PromptExecutionLogs { get; set; } = null!;
     public DbSet<DocumentProcessingJob> DocumentProcessingJobs { get; set; } = null!;
     public DbSet<SearchIndexConfig> SearchIndexConfigs { get; set; } = null!;
     public DbSet<ApiRequestLog> ApiRequestLogs { get; set; } = null!;
     public DbSet<ErrorNotification> ErrorNotifications { get; set; } = null!;
+
+    // ── AGONESPot tables ─────────────────────────────────────────────
+    public DbSet<SpotJob> SpotJobs { get; set; } = null!;
+    public DbSet<SpotJobLog> SpotJobLogs { get; set; } = null!;
+    public DbSet<SpotDocumentMetadata> SpotDocuments { get; set; } = null!;
+    public DbSet<SpotReport> SpotReports { get; set; } = null!;
+    public DbSet<SpotCompany> SpotCompanies { get; set; } = null!;
+    public DbSet<SpotRegisteredCompany> SpotRegisteredCompanies { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -114,6 +124,59 @@ public class AIHubDbContext : DbContext
             e.HasIndex(x => new { x.Project, x.IndexName }).IsUnique();
             e.Property(x => x.Project).HasConversion<string>().HasMaxLength(50);
             e.Property(x => x.IndexName).HasMaxLength(200);
+        });
+
+        // ── AGONESPot: Jobs ──────────────────────────────────────────
+        mb.Entity<SpotJob>(e =>
+        {
+            e.ToTable("Jobs");
+            e.HasKey(x => x.JobId);
+            e.Property(x => x.Status).HasMaxLength(50);
+            e.Property(x => x.CompanyId).HasMaxLength(450);
+            e.Property(x => x.UserId).HasMaxLength(450);
+        });
+
+        mb.Entity<SpotJobLog>(e =>
+        {
+            e.ToTable("JobLogs");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.JobId).HasMaxLength(450);
+        });
+
+        // ── AGONESPot: DocumentMetadata ──────────────────────────────
+        mb.Entity<SpotDocumentMetadata>(e =>
+        {
+            e.ToTable("DocumentMetadata");
+            e.HasKey(x => x.FileUID);
+            e.Property(x => x.FileUID).HasMaxLength(36);
+            e.Property(x => x.CompanyId).HasMaxLength(450);
+            e.Property(x => x.FileHash).HasMaxLength(64);
+            e.HasIndex(x => new { x.CompanyId, x.FileHash })
+                .IsUnique().HasDatabaseName("uq_company_filehash");
+        });
+
+        // ── AGONESPot: Reports ───────────────────────────────────────
+        mb.Entity<SpotReport>(e =>
+        {
+            e.ToTable("Reports");
+            e.HasKey(x => x.ReportId);
+            e.Property(x => x.CompanyId).HasMaxLength(450);
+        });
+
+        // ── AGONESPot: Company + RegisteredCompany ───────────────────
+        mb.Entity<SpotCompany>(e =>
+        {
+            e.ToTable("Company");
+            e.HasKey(x => x.CompanyId);
+            e.Property(x => x.CompanyId).HasMaxLength(450);
+        });
+
+        mb.Entity<SpotRegisteredCompany>(e =>
+        {
+            e.ToTable("RegisteredCompany");
+            e.HasKey(x => x.CompanyId);
+            e.Property(x => x.CompanyId).HasMaxLength(450);
+            e.Property(x => x.CompanyName).HasMaxLength(450);
         });
 
         // ── Seed AGONESPot prompt templates ──────────────────────────

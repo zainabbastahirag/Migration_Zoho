@@ -31,6 +31,12 @@ builder.Services.AddScoped<INotificationService, NotificationService>();
 // ── Project-specific Services ────────────────────────────────────────
 builder.Services.AddScoped<ISpotService, SpotService>();
 
+// ── AGONESPot Classification ─────────────────────────────────────────
+builder.Services.Configure<AGONEAIHub.Infrastructure.Services.Spot.SpotSettings>(
+    builder.Configuration.GetSection("AGONESPot"));
+builder.Services.AddScoped<IClassificationService,
+    AGONEAIHub.Infrastructure.Services.Spot.ClassificationService>();
+
 // ── API + Swagger ────────────────────────────────────────────────────
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
