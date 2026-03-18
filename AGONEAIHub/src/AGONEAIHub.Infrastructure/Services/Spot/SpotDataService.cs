@@ -27,6 +27,7 @@ public class SpotDataService : ISpotDataService
     private readonly DocumentAnalysisClient _docInt;
     private readonly IChatService _chat;
     private readonly INotificationService _notify;
+    private readonly SpotServiceBus _serviceBus;
     private readonly ILogger<SpotDataService> _log;
 
     private static readonly HashSet<string> EligibleDocTypes = new(StringComparer.OrdinalIgnoreCase)
@@ -40,9 +41,11 @@ public class SpotDataService : ISpotDataService
 
     public SpotDataService(
         AIHubDbContext db, IOptions<SpotSettings> cfg,
-        IChatService chat, INotificationService notify, ILogger<SpotDataService> log)
+        IChatService chat, INotificationService notify,
+        SpotServiceBus serviceBus, ILogger<SpotDataService> log)
     {
-        _db = db; _cfg = cfg.Value; _chat = chat; _notify = notify; _log = log;
+        _db = db; _cfg = cfg.Value; _chat = chat; _notify = notify;
+        _serviceBus = serviceBus; _log = log;
         _blob = new BlobServiceClient(_cfg.BlobConnectionString);
         _docInt = new DocumentAnalysisClient(new Uri(_cfg.DocIntEndpoint), new AzureKeyCredential(_cfg.DocIntKey));
     }
@@ -103,6 +106,13 @@ public class SpotDataService : ISpotDataService
             job.Status = nameof(JobState.Failed); await _db.SaveChangesAsync(ct);
             return Fail(400, ex.InnerException?.Message ?? ex.Message);
         }
+
+        // Send to Azure Service Bus classify queue (production)
+        // In dev mode (UseServiceBus=false), call /api/spot/classify-worker directly
+        await _serviceBus.SendClassifyJobAsync(job.JobId.ToString(), (int)JobType.Classify, ct);
+
+        _log.LogInformation("[CLASSIFY] Queued: company={Company}, jobId={JobId}, file={File}",
+            companyId, job.JobId, fileName);
 
         return Ok("File uploaded and queued for classification.", MapDoc(doc));
     }
@@ -368,6 +378,13 @@ public class SpotDataService : ISpotDataService
 
         var report = new SpotReport { JobId = job.JobId.ToString(), CompanyId = companyId, ReportType = type, SourceFiles = idsString, SourceFilesSortedHash = hashesString };
         _db.SpotReports.Add(report); await _db.SaveChangesAsync(ct);
+
+        // Send to Azure Service Bus report queue (production)
+        // In dev mode (UseServiceBus=false), call /api/spot/generate-report-worker directly
+        await _serviceBus.SendReportJobAsync(job.JobId.ToString(), (int)JobType.Report, ct);
+
+        _log.LogInformation("[REPORT] Queued: company={Company}, jobId={JobId}, type={Type}",
+            companyId, job.JobId, type);
 
         return Ok("Report generation queued.", MapReport(report));
     }

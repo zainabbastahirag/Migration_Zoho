@@ -39,6 +39,7 @@ builder.Services.AddScoped<ISpotService, SpotService>();
 // ── AGONESPot — single service for all Spot operations ───────────────
 builder.Services.Configure<AGONEAIHub.Infrastructure.Configuration.SpotSettings>(
     builder.Configuration.GetSection("AGONESPot"));
+builder.Services.AddSingleton<AGONEAIHub.Infrastructure.Services.Spot.SpotServiceBus>();
 builder.Services.AddScoped<ISpotDataService,
     AGONEAIHub.Infrastructure.Services.Spot.SpotDataService>();
 
