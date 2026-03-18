@@ -36,6 +36,8 @@ builder.Services.Configure<AGONEAIHub.Infrastructure.Services.Spot.SpotSettings>
     builder.Configuration.GetSection("AGONESPot"));
 builder.Services.AddScoped<IClassificationService,
     AGONEAIHub.Infrastructure.Services.Spot.ClassificationService>();
+builder.Services.AddScoped<IDataroomService,
+    AGONEAIHub.Infrastructure.Services.Spot.DataroomService>();
 
 // ── API + Swagger ────────────────────────────────────────────────────
 builder.Services.AddControllers();
