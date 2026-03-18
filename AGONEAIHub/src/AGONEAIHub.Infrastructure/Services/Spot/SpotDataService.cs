@@ -512,68 +512,36 @@ public class SpotDataService : ISpotDataService
             await container.GetBlobClient(combinedBlobName)
                 .UploadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(combinedJson)), true, ct);
 
-            // ── Step 5: Generate report sections via OpenAI ──────────
-            await LogStep(jobId, "Generating report content via AI...", ct);
-            var sectionResults = new Dictionary<string, string>();
+            // ── Step 5: Generate full SPOT report via orchestrator ────
+            await LogStep(jobId, "Generating report content via AI (A1-E3 parallel)...", ct);
 
-            foreach (var section in ReportSections)
+            var docs = allExtractedTexts.Select(t => new ExtractedDocument
             {
-                var promptKey = section.ToLowerInvariant() switch
-                {
-                    "sectiona" => "generate-section-a",
-                    "sectionb" => "generate-section-b",
-                    "sectionc" => "generate-section-c",
-                    "sectiond" => "generate-section-d",
-                    _ => $"generate-{section.ToLowerInvariant()}"
-                };
+                FileName = t.FileName, DocType = t.DocType, Text = t.Text
+            }).ToList();
 
-                await LogStep(jobId, $"Generating {section}...", ct);
+            var orchestrator = new SpotReportOrchestrator(_chat, _log);
+            var spotResult = await orchestrator.GenerateAsync(job.CompanyId, docs, ct);
 
-                var chatResult = await _chat.ChatWithTemplateAsync(
-                    Core.Enums.ProjectName.AGONESPot, promptKey,
-                    new Dictionary<string, string>
-                    {
-                        ["reportTitle"] = $"SPOT Report - {job.CompanyId}",
-                        ["auditData"] = combinedContext.Length > 30000
-                            ? combinedContext[..30000] : combinedContext
-                    }, ct);
-
-                sectionResults[section] = chatResult.Success
-                    ? chatResult.Response ?? ""
-                    : $"[ERROR generating {section}: {chatResult.ErrorMessage}]";
-
-                _log.LogInformation("  {Section}: {Status} ({Tokens} tokens)",
-                    section, chatResult.Success ? "OK" : "FAILED", chatResult.TotalTokens);
+            if (!spotResult.Success)
+            {
+                await FailReportAsync(jobId, job.CompanyId,
+                    spotResult.ErrorMessage ?? "Report generation failed.", ct);
+                return Fail(500, spotResult.ErrorMessage ?? "Report generation failed.");
             }
 
-            // ── Step 6: Combine into final report ────────────────────
-            await LogStep(jobId, "Assembling final report...", ct);
-            var reportContent = $"# SPOT Report — {job.CompanyId}\n" +
-                $"Generated: {DateTime.UtcNow:yyyy-MM-dd HH:mm} UTC\n\n" +
-                $"## Section A: Executive Summary\n\n{sectionResults.GetValueOrDefault("SectionA", "")}\n\n" +
-                $"## Section B: Findings & Observations\n\n{sectionResults.GetValueOrDefault("SectionB", "")}\n\n" +
-                $"## Section C: Risk Assessment\n\n{sectionResults.GetValueOrDefault("SectionC", "")}\n\n" +
-                $"## Section D: Recommendations & Action Plan\n\n{sectionResults.GetValueOrDefault("SectionD", "")}";
+            // ── Step 6: Upload report + JSON to blob ─────────────────
+            await LogStep(jobId, "Uploading report to storage...", ct);
 
-            // Upload report to blob
-            var ext = job.ReportType == "pdf" ? "pdf" : "md";
-            var reportBlobName = $"reports/{job.CompanyId}/{jobId}_spot_report.{ext}";
-            var reportBytes = System.Text.Encoding.UTF8.GetBytes(reportContent);
+            var reportBlobName = $"reports/{job.CompanyId}/{jobId}_spot_report.md";
+            var reportBytes = System.Text.Encoding.UTF8.GetBytes(spotResult.ReportMarkdown ?? "");
             await container.GetBlobClient(reportBlobName)
                 .UploadAsync(new MemoryStream(reportBytes), true, ct);
-
             var reportUrl = container.GetBlobClient(reportBlobName).Uri.ToString();
 
-            // Upload JSON version too
             var jsonReportBlobName = $"reports/{job.CompanyId}/{jobId}_spot_report.json";
-            var jsonReport = JsonSerializer.Serialize(new
-            {
-                companyId = job.CompanyId,
-                generatedAt = DateTime.UtcNow,
-                sections = sectionResults
-            });
             await container.GetBlobClient(jsonReportBlobName)
-                .UploadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(jsonReport)), true, ct);
+                .UploadAsync(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(spotResult.ReportJson ?? "{}")), true, ct);
             var jsonUrl = container.GetBlobClient(jsonReportBlobName).Uri.ToString();
 
             // ── Step 7: Update DB ────────────────────────────────────
