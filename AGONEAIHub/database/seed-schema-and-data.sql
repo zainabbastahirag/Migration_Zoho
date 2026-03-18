@@ -255,5 +255,126 @@ FROM [aihub].[ErrorNotifications]
 GROUP BY Project, Service, Operation, Status;
 GO
 
-PRINT 'AGONEAIHub schema + seed data complete.';
+-- =====================================================================
+-- EF MIGRATIONS HISTORY (in aihub schema, not dbo)
+-- =====================================================================
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'aihub' AND TABLE_NAME = '__EFMigrationsHistory')
+CREATE TABLE [aihub].[__EFMigrationsHistory] (
+    [MigrationId]    NVARCHAR(150) NOT NULL PRIMARY KEY,
+    [ProductVersion] NVARCHAR(32)  NOT NULL
+);
+GO
+
+-- =====================================================================
+-- AGONESPOT TABLES (all in aihub schema)
+-- =====================================================================
+
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'aihub' AND TABLE_NAME = 'SpotJobs')
+CREATE TABLE [aihub].[SpotJobs] (
+    [JobId]      UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
+    [JobType]    INT              NOT NULL,
+    [Status]     NVARCHAR(50)     NOT NULL DEFAULT 'PendingQueue',
+    [CompanyId]  NVARCHAR(450)    NOT NULL,
+    [UserId]     NVARCHAR(450)    NULL,
+    [BlobUrl]    NVARCHAR(MAX)    NULL DEFAULT '',
+    [CreatedAt]  DATETIME2        NOT NULL DEFAULT GETUTCDATE(),
+    [StartedAt]  DATETIME2        NULL,
+    [FinishedAt] DATETIME2        NULL,
+    [ReportType] NVARCHAR(50)     NULL DEFAULT '',
+    [Notes]      NVARCHAR(MAX)    NULL DEFAULT 'Job queued'
+);
+GO
+CREATE INDEX IX_SpotJobs_Company ON [aihub].[SpotJobs] ([CompanyId]);
+CREATE INDEX IX_SpotJobs_Status ON [aihub].[SpotJobs] ([Status]);
+GO
+
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'aihub' AND TABLE_NAME = 'SpotJobLogs')
+CREATE TABLE [aihub].[SpotJobLogs] (
+    [Id]        INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [JobId]     NVARCHAR(450)     NOT NULL,
+    [Message]   NVARCHAR(MAX)     NOT NULL,
+    [CreatedAt] DATETIME2         NOT NULL DEFAULT GETUTCDATE()
+);
+GO
+CREATE INDEX IX_SpotJobLogs_JobId ON [aihub].[SpotJobLogs] ([JobId]);
+GO
+
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'aihub' AND TABLE_NAME = 'SpotDocuments')
+CREATE TABLE [aihub].[SpotDocuments] (
+    [FileUID]            NVARCHAR(36)  NOT NULL PRIMARY KEY,
+    [JobId]              NVARCHAR(450) NOT NULL,
+    [CompanyId]          NVARCHAR(450) NOT NULL,
+    [FileName]           NVARCHAR(MAX) NOT NULL,
+    [FileSize]           INT           NOT NULL,
+    [FileType]           NVARCHAR(50)  NOT NULL,
+    [FileHash]           NVARCHAR(64)  NOT NULL,
+    [CreatedDate]        DATETIME2     NOT NULL DEFAULT GETUTCDATE(),
+    [IsDeleted]          BIT           NOT NULL DEFAULT 0,
+    [Notes]              NVARCHAR(MAX) NULL DEFAULT '',
+    [Confidence]         FLOAT         NULL,
+    [CreatedBy]          NVARCHAR(450) NULL DEFAULT '',
+    [DeletedBy]          NVARCHAR(450) NULL DEFAULT '',
+    [DeletedDate]        DATETIME2     NULL,
+    [DocOfCompany]       NVARCHAR(MAX) NULL DEFAULT '',
+    [DocOfCompanyRegNo]  NVARCHAR(450) NULL,
+    [DocumentType]       NVARCHAR(100) NULL DEFAULT '',
+    [FilePath]           NVARCHAR(MAX) NULL DEFAULT '',
+    [FileProcessState]   NVARCHAR(50)  NULL DEFAULT '',
+    [FileState]          NVARCHAR(50)  NULL DEFAULT '',
+    [FileURL]            NVARCHAR(MAX) NULL DEFAULT '',
+    [Tags]               NVARCHAR(MAX) NULL DEFAULT '',
+    [WrongType]          BIT           NOT NULL DEFAULT 0,
+    [ExtractedText]      NVARCHAR(MAX) NULL,
+    [ExtractedPageCount] INT           NULL
+);
+GO
+CREATE INDEX IX_SpotDoc_Company ON [aihub].[SpotDocuments] ([CompanyId]);
+CREATE INDEX IX_SpotDoc_JobId ON [aihub].[SpotDocuments] ([JobId]);
+CREATE UNIQUE INDEX IX_SpotDoc_CompanyHash ON [aihub].[SpotDocuments] ([CompanyId], [FileHash]);
+GO
+
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'aihub' AND TABLE_NAME = 'SpotReports')
+CREATE TABLE [aihub].[SpotReports] (
+    [ReportId]              UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
+    [JobId]                 NVARCHAR(450)    NOT NULL,
+    [CompanyId]             NVARCHAR(450)    NOT NULL,
+    [ReportType]            NVARCHAR(50)     NOT NULL,
+    [FileURL]               NVARCHAR(MAX)    NULL,
+    [JsonURL]               NVARCHAR(MAX)    NULL,
+    [CreatedAt]             DATETIME2        NOT NULL DEFAULT GETUTCDATE(),
+    [SourceFiles]           NVARCHAR(MAX)    NULL,
+    [SourceFilesSortedHash] NVARCHAR(MAX)    NULL,
+    [GenerationType]        NVARCHAR(50)     NULL DEFAULT 'new_generated',
+    [IsDeleted]             BIT              NOT NULL DEFAULT 0,
+    [DeletedBy]             NVARCHAR(450)    NOT NULL DEFAULT '',
+    [DeletedDate]           DATETIME2        NULL,
+    [ReportMarkdown]        NVARCHAR(MAX)    NULL,
+    [ReportJsonContent]     NVARCHAR(MAX)    NULL
+);
+GO
+CREATE INDEX IX_SpotReports_Company ON [aihub].[SpotReports] ([CompanyId]);
+CREATE INDEX IX_SpotReports_JobId ON [aihub].[SpotReports] ([JobId]);
+GO
+
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'aihub' AND TABLE_NAME = 'SpotCompanies')
+CREATE TABLE [aihub].[SpotCompanies] (
+    [CompanyId]                  NVARCHAR(450) NOT NULL PRIMARY KEY,
+    [CompanyProfileJson]         NVARCHAR(MAX) NULL,
+    [CompanyProfileSourceFileId] NVARCHAR(450) NULL,
+    [CreatedAt]                  DATETIME2     NULL
+);
+GO
+
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'aihub' AND TABLE_NAME = 'SpotRegisteredCompanies')
+CREATE TABLE [aihub].[SpotRegisteredCompanies] (
+    [CompanyId]          NVARCHAR(450) NOT NULL PRIMARY KEY,
+    [CompanyName]        NVARCHAR(450) NOT NULL,
+    [RepresentativeName] NVARCHAR(450) NULL,
+    [PhoneNumber]        NVARCHAR(450) NULL,
+    [CompanyAddress]     NVARCHAR(450) NULL,
+    [Email]              NVARCHAR(450) NULL
+);
+GO
+
+PRINT 'AGONEAIHub schema + seed data complete. All tables in [aihub] schema.';
 GO

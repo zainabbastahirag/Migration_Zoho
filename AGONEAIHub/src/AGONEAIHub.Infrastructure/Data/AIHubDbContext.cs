@@ -29,6 +29,9 @@ public class AIHubDbContext : DbContext
     {
         base.OnModelCreating(mb);
 
+        // ── DEFAULT SCHEMA: all tables under "aihub" ─────────────────
+        mb.HasDefaultSchema("aihub");
+
         // ── PromptTemplates ──────────────────────────────────────────
         mb.Entity<PromptTemplate>(e =>
         {
@@ -129,8 +132,10 @@ public class AIHubDbContext : DbContext
         // ── AGONESPot: Jobs ──────────────────────────────────────────
         mb.Entity<SpotJob>(e =>
         {
-            e.ToTable("Jobs");
+            e.ToTable("SpotJobs", "aihub");
             e.HasKey(x => x.JobId);
+            e.HasIndex(x => x.CompanyId);
+            e.HasIndex(x => x.Status);
             e.Property(x => x.Status).HasMaxLength(50);
             e.Property(x => x.CompanyId).HasMaxLength(450);
             e.Property(x => x.UserId).HasMaxLength(450);
@@ -138,42 +143,47 @@ public class AIHubDbContext : DbContext
 
         mb.Entity<SpotJobLog>(e =>
         {
-            e.ToTable("JobLogs");
+            e.ToTable("SpotJobLogs", "aihub");
             e.HasKey(x => x.Id);
+            e.HasIndex(x => x.JobId);
             e.Property(x => x.JobId).HasMaxLength(450);
         });
 
         // ── AGONESPot: DocumentMetadata ──────────────────────────────
         mb.Entity<SpotDocumentMetadata>(e =>
         {
-            e.ToTable("DocumentMetadata");
+            e.ToTable("SpotDocuments", "aihub");
             e.HasKey(x => x.FileUID);
+            e.HasIndex(x => x.CompanyId);
+            e.HasIndex(x => x.JobId);
             e.Property(x => x.FileUID).HasMaxLength(36);
             e.Property(x => x.CompanyId).HasMaxLength(450);
             e.Property(x => x.FileHash).HasMaxLength(64);
             e.HasIndex(x => new { x.CompanyId, x.FileHash })
-                .IsUnique().HasDatabaseName("uq_company_filehash");
+                .IsUnique().HasDatabaseName("IX_SpotDoc_CompanyHash");
         });
 
         // ── AGONESPot: Reports ───────────────────────────────────────
         mb.Entity<SpotReport>(e =>
         {
-            e.ToTable("Reports");
+            e.ToTable("SpotReports", "aihub");
             e.HasKey(x => x.ReportId);
+            e.HasIndex(x => x.CompanyId);
+            e.HasIndex(x => x.JobId);
             e.Property(x => x.CompanyId).HasMaxLength(450);
         });
 
         // ── AGONESPot: Company + RegisteredCompany ───────────────────
         mb.Entity<SpotCompany>(e =>
         {
-            e.ToTable("Company");
+            e.ToTable("SpotCompanies", "aihub");
             e.HasKey(x => x.CompanyId);
             e.Property(x => x.CompanyId).HasMaxLength(450);
         });
 
         mb.Entity<SpotRegisteredCompany>(e =>
         {
-            e.ToTable("RegisteredCompany");
+            e.ToTable("SpotRegisteredCompanies", "aihub");
             e.HasKey(x => x.CompanyId);
             e.Property(x => x.CompanyId).HasMaxLength(450);
             e.Property(x => x.CompanyName).HasMaxLength(450);

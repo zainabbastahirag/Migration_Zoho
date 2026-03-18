@@ -11,7 +11,12 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddDbContext<AIHubDbContext>(opt =>
     opt.UseSqlServer(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-        sql => { sql.CommandTimeout(120); sql.EnableRetryOnFailure(3); }));
+        sql =>
+        {
+            sql.CommandTimeout(120);
+            sql.EnableRetryOnFailure(3);
+            sql.MigrationsHistoryTable("__EFMigrationsHistory", "aihub");
+        }));
 
 // ── Configuration ────────────────────────────────────────────────────
 builder.Services.Configure<OpenAISettings>(
