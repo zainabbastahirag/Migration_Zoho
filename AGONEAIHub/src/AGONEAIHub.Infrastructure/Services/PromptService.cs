@@ -13,12 +13,32 @@ public class PromptService : IPromptService
 
     public PromptService(AIHubDbContext db) => _db = db;
 
-    public async Task<PromptTemplate?> GetTemplateAsync(ProjectName project, string promptKey, CancellationToken ct = default) =>
+    public async Task<PromptTemplate?> GetTemplateAsync(
+        ProjectName project, string module, string section, string promptKey, CancellationToken ct = default) =>
         await _db.PromptTemplates.FirstOrDefaultAsync(p =>
-            p.Project == project && p.PromptKey == promptKey && p.IsActive, ct);
+            p.Project == project && p.Module == module && p.Section == section
+            && p.PromptKey == promptKey && p.IsActive, ct);
 
-    public async Task<List<PromptTemplate>> GetAllTemplatesAsync(ProjectName project, CancellationToken ct = default) =>
-        await _db.PromptTemplates.Where(p => p.Project == project).OrderBy(p => p.Category).ThenBy(p => p.Name).ToListAsync(ct);
+    public async Task<List<PromptTemplate>> GetByModuleAsync(
+        ProjectName project, string module, CancellationToken ct = default) =>
+        await _db.PromptTemplates
+            .Where(p => p.Project == project && p.Module == module && p.IsActive)
+            .OrderBy(p => p.Section).ThenBy(p => p.Name)
+            .ToListAsync(ct);
+
+    public async Task<List<PromptTemplate>> GetBySectionAsync(
+        ProjectName project, string module, string section, CancellationToken ct = default) =>
+        await _db.PromptTemplates
+            .Where(p => p.Project == project && p.Module == module && p.Section == section && p.IsActive)
+            .OrderBy(p => p.Name)
+            .ToListAsync(ct);
+
+    public async Task<List<PromptTemplate>> GetAllTemplatesAsync(
+        ProjectName project, CancellationToken ct = default) =>
+        await _db.PromptTemplates
+            .Where(p => p.Project == project)
+            .OrderBy(p => p.Module).ThenBy(p => p.Section).ThenBy(p => p.Name)
+            .ToListAsync(ct);
 
     public async Task<PromptTemplate> CreateTemplateAsync(PromptTemplate template, CancellationToken ct = default)
     {
@@ -38,12 +58,8 @@ public class PromptService : IPromptService
 
     public async Task DeleteTemplateAsync(int id, CancellationToken ct = default)
     {
-        var template = await _db.PromptTemplates.FindAsync(new object[] { id }, ct);
-        if (template != null)
-        {
-            _db.PromptTemplates.Remove(template);
-            await _db.SaveChangesAsync(ct);
-        }
+        var t = await _db.PromptTemplates.FindAsync(new object[] { id }, ct);
+        if (t != null) { _db.PromptTemplates.Remove(t); await _db.SaveChangesAsync(ct); }
     }
 
     public string RenderTemplate(string template, Dictionary<string, string> variables)
@@ -54,7 +70,7 @@ public class PromptService : IPromptService
         return Regex.Replace(template, @"\{\{(\w+)\}\}", match =>
         {
             var key = match.Groups[1].Value;
-            return variables.TryGetValue(key, out var value) ? value : match.Value;
+            return variables.TryGetValue(key, out var val) ? val : match.Value;
         });
     }
 }

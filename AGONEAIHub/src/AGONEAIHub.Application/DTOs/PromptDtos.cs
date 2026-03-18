@@ -6,6 +6,8 @@ public class PromptTemplateDto
 {
     public int Id { get; set; }
     public ProjectName Project { get; set; }
+    public string Module { get; set; } = string.Empty;
+    public string Section { get; set; } = string.Empty;
     public string PromptKey { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public string? Description { get; set; }
@@ -15,12 +17,15 @@ public class PromptTemplateDto
     public int MaxTokens { get; set; } = 4096;
     public double Temperature { get; set; } = 0.7;
     public bool IsActive { get; set; } = true;
-    public string? Category { get; set; }
+    public int Version { get; set; } = 1;
+    public string? Tags { get; set; }
 }
 
 public class CreatePromptRequest
 {
     public ProjectName Project { get; set; }
+    public string Module { get; set; } = string.Empty;
+    public string Section { get; set; } = "General";
     public string PromptKey { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public string? Description { get; set; }
@@ -29,7 +34,7 @@ public class CreatePromptRequest
     public string Model { get; set; } = "gpt-4o";
     public int MaxTokens { get; set; } = 4096;
     public double Temperature { get; set; } = 0.7;
-    public string? Category { get; set; }
+    public string? Tags { get; set; }
 }
 
 public class UpdatePromptRequest
@@ -42,5 +47,5 @@ public class UpdatePromptRequest
     public int? MaxTokens { get; set; }
     public double? Temperature { get; set; }
     public bool? IsActive { get; set; }
-    public string? Category { get; set; }
+    public string? Tags { get; set; }
 }

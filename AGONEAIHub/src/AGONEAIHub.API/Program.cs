@@ -1,3 +1,4 @@
+using AGONEAIHub.API.Middleware;
 using AGONEAIHub.Core.Interfaces;
 using AGONEAIHub.Infrastructure.Configuration;
 using AGONEAIHub.Infrastructure.Data;
@@ -20,11 +21,15 @@ builder.Services.Configure<AzureDocIntelligenceSettings>(
 builder.Services.Configure<AzureAISearchSettings>(
     builder.Configuration.GetSection("AzureAISearch"));
 
-// ── Services ─────────────────────────────────────────────────────────
+// ── Core Services ────────────────────────────────────────────────────
 builder.Services.AddScoped<IPromptService, PromptService>();
 builder.Services.AddScoped<IChatService, OpenAIChatService>();
 builder.Services.AddScoped<IDocumentIntelligenceService, AzureDocumentIntelligenceService>();
 builder.Services.AddScoped<IAISearchService, AzureAISearchService>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
+
+// ── Project-specific Services ────────────────────────────────────────
+builder.Services.AddScoped<ISpotService, SpotService>();
 
 // ── API + Swagger ────────────────────────────────────────────────────
 builder.Services.AddControllers();
@@ -36,8 +41,8 @@ builder.Services.AddSwaggerGen(c =>
         Title = "AGONE AI Hub",
         Version = "v1",
         Description = "Centralized AI services for AGONELearn, AGONEWork, AGONESPot, AGONEPulse.\n\n" +
-                      "Every request includes a `project` field so data is separated per team.\n\n" +
-                      "**Services:** OpenAI Chat | Azure Document Intelligence | Azure AI Search"
+                      "Every request is tagged with a project. All prompts stored in DB.\n" +
+                      "Full request/response logging + error notification system."
     });
     c.UseInlineDefinitionsForEnums();
 });
@@ -53,6 +58,8 @@ if (app.Environment.IsDevelopment())
 }
 
 // ── Middleware ────────────────────────────────────────────────────────
+app.UseMiddleware<ApiLoggingMiddleware>();
+
 app.UseSwagger();
 app.UseSwaggerUI(c =>
 {

@@ -1,10 +1,12 @@
 using System.ClientModel;
 using System.Diagnostics;
+using System.Text.Json;
 using AGONEAIHub.Core.Entities;
 using AGONEAIHub.Core.Enums;
 using AGONEAIHub.Core.Interfaces;
 using AGONEAIHub.Infrastructure.Configuration;
 using AGONEAIHub.Infrastructure.Data;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OpenAI.Chat;
@@ -45,20 +47,28 @@ public class OpenAIChatService : IChatService
         }
     }
 
+    /// <summary>
+    /// Chat using a stored prompt template.
+    /// Looks up by Project + PromptKey across all modules/sections.
+    /// </summary>
     public async Task<ChatResult> ChatWithTemplateAsync(
         ProjectName project, string promptKey,
         Dictionary<string, string> variables,
         CancellationToken ct = default)
     {
-        var template = await _promptService.GetTemplateAsync(project, promptKey, ct);
+        // Find template by promptKey (search across all modules/sections for this project)
+        var template = await _db.PromptTemplates
+            .Where(p => p.Project == project && p.PromptKey == promptKey && p.IsActive)
+            .OrderByDescending(p => p.Version)
+            .FirstOrDefaultAsync(ct);
+
         if (template == null)
             return new ChatResult { Success = false, ErrorMessage = $"Prompt template '{promptKey}' not found for project {project}" };
 
         var systemPrompt = _promptService.RenderTemplate(template.SystemPrompt, variables);
         var userMessage = _promptService.RenderTemplate(template.UserPromptTemplate, variables);
 
-        return await ChatAsync(project, systemPrompt, userMessage,
-            template.Model, template.MaxTokens, template.Temperature, ct, promptKey);
+        return await ExecuteChatAsync(project, template, systemPrompt, userMessage, variables, ct);
     }
 
     public async Task<ChatResult> ChatAsync(
@@ -66,14 +76,25 @@ public class OpenAIChatService : IChatService
         string model = "gpt-4o", int maxTokens = 4096, double temperature = 0.7,
         CancellationToken ct = default)
     {
-        return await ChatAsync(project, systemPrompt, userMessage, model, maxTokens, temperature, ct, "direct");
+        return await ExecuteChatAsync(project, null, systemPrompt, userMessage, null, ct,
+            model, maxTokens, temperature, "direct");
     }
 
-    private async Task<ChatResult> ChatAsync(
-        ProjectName project, string systemPrompt, string userMessage,
-        string model, int maxTokens, double temperature,
-        CancellationToken ct, string promptKey)
+    private async Task<ChatResult> ExecuteChatAsync(
+        ProjectName project, PromptTemplate? template,
+        string systemPrompt, string userMessage,
+        Dictionary<string, string>? variables, CancellationToken ct,
+        string? modelOverride = null, int? maxTokensOverride = null,
+        double? temperatureOverride = null, string? promptKeyOverride = null)
     {
+        var correlationId = Guid.NewGuid().ToString("N");
+        var model = modelOverride ?? template?.Model ?? _settings.DefaultModel;
+        var maxTokens = maxTokensOverride ?? template?.MaxTokens ?? 4096;
+        var temperature = temperatureOverride ?? template?.Temperature ?? 0.7;
+        var promptKey = promptKeyOverride ?? template?.PromptKey ?? "direct";
+        var module = template?.Module ?? "Direct";
+        var section = template?.Section ?? "General";
+
         var sw = Stopwatch.StartNew();
         try
         {
@@ -90,8 +111,8 @@ public class OpenAIChatService : IChatService
             };
 
             var completion = await _chatClient.CompleteChatAsync(messages, options, ct);
-
             sw.Stop();
+
             var result = new ChatResult
             {
                 Success = true,
@@ -102,43 +123,63 @@ public class OpenAIChatService : IChatService
                 DurationMs = sw.ElapsedMilliseconds
             };
 
-            await LogExecutionAsync(project, promptKey, model, userMessage, result, ct);
+            await LogExecutionAsync(project, correlationId, template, module, section, promptKey,
+                model, systemPrompt, userMessage, variables, result, ct);
+
             return result;
         }
         catch (Exception ex)
         {
             sw.Stop();
-            _log.LogError(ex, "OpenAI chat failed for {Project}/{PromptKey}", project, promptKey);
+            _log.LogError(ex, "OpenAI chat failed: {Project}/{Module}/{Section}/{Key}",
+                project, module, section, promptKey);
+
             var result = new ChatResult
             {
                 Success = false,
                 ErrorMessage = ex.Message,
                 DurationMs = sw.ElapsedMilliseconds
             };
-            await LogExecutionAsync(project, promptKey, model, userMessage, result, ct);
+
+            await LogExecutionAsync(project, correlationId, template, module, section, promptKey,
+                model, systemPrompt, userMessage, variables, result, ct);
+
             return result;
         }
     }
 
     private async Task LogExecutionAsync(
-        ProjectName project, string promptKey, string model,
-        string? input, ChatResult result, CancellationToken ct)
+        ProjectName project, string correlationId, PromptTemplate? template,
+        string module, string section, string promptKey, string model,
+        string? systemPrompt, string? userPrompt,
+        Dictionary<string, string>? variables, ChatResult result, CancellationToken ct)
     {
         _db.PromptExecutionLogs.Add(new PromptExecutionLog
         {
             Project = project,
+            CorrelationId = correlationId,
+            PromptTemplateId = template?.Id,
+            Module = module,
+            Section = section,
             PromptKey = promptKey,
             Model = model,
-            InputText = input?.Length > 4000 ? input[..4000] : input,
-            OutputText = result.Response?.Length > 4000 ? result.Response[..4000] : result.Response,
+            RenderedSystemPrompt = Truncate(systemPrompt, 4000),
+            RenderedUserPrompt = Truncate(userPrompt, 4000),
+            OutputText = Truncate(result.Response, 8000),
+            VariablesJson = variables != null ? Truncate(JsonSerializer.Serialize(variables), 4000) : null,
             PromptTokens = result.PromptTokens,
             CompletionTokens = result.CompletionTokens,
             TotalTokens = result.TotalTokens,
             DurationMs = result.DurationMs,
             Success = result.Success,
-            ErrorMessage = result.ErrorMessage,
+            ErrorMessage = Truncate(result.ErrorMessage, 2000),
             CreatedAt = DateTime.UtcNow
         });
-        await _db.SaveChangesAsync(ct);
+
+        try { await _db.SaveChangesAsync(ct); }
+        catch (Exception ex) { _log.LogError(ex, "Failed to save execution log"); }
     }
+
+    private static string? Truncate(string? s, int max) =>
+        s != null && s.Length > max ? s[..max] : s;
 }
